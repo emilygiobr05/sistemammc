@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Planilha Master — Rondônia</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
+
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -3283,110 +3283,59 @@ function admRenderBackup(el){
     </div>`;
 }
 
-// ── GOOGLE SHEETS SYNC ───────────────────────────────────────────────────────
+// ── GOOGLE SHEETS SYNC — via Apps Script Web App (sem OAuth/Client ID) ────────
 const GS_SPREADSHEET_ID = '1iEXnpHQ7jKWiEkNYYsSOtFFNvXdj_O5d8yv4uj9yrDU';
-const GS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
-let gsAccessToken = null;
-let gsTokenExpiry = 0;
-let gsTokenClient = null;
 let gsLastSync = localStorage.getItem('GS_LAST_SYNC') || null;
 
 function gsLoadConfig(){try{return JSON.parse(localStorage.getItem('GS_CONFIG')||'{}');}catch(e){return{};}}
 function gsSaveConfig(cfg){localStorage.setItem('GS_CONFIG',JSON.stringify(cfg));}
-function gsIsAuthenticated(){return !!(gsAccessToken && Date.now() < gsTokenExpiry - 30000);}
+function gsIsReady(){return !!(gsLoadConfig().webAppUrl||'').trim();}
 
-function gsInitTokenClient(){
+// ── Apps Script fetch helpers ─────────────────────────────────────────────────
+async function gasGet(sheet){
   const cfg = gsLoadConfig();
-  if(!cfg.clientId) return null;
-  if(typeof google === 'undefined' || !google.accounts || !google.accounts.oauth2) return null;
-  gsTokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: cfg.clientId,
-    scope: 'https://www.googleapis.com/auth/spreadsheets',
-    callback: '',
-  });
-  return gsTokenClient;
-}
-
-function gsAuth(callback){
-  if(gsIsAuthenticated()){if(callback) callback(); return;}
-  const cfg = gsLoadConfig();
-  if(!cfg.clientId){
-    toast('Configure o Client ID OAuth nas configurações de Google Sheets (Administração → Google Sheets).','err');
-    return;
-  }
-  if(!gsTokenClient) gsInitTokenClient();
-  if(!gsTokenClient){
-    toast('Biblioteca Google Identity Services ainda não carregou. Aguarde e tente novamente.','err');
-    return;
-  }
-  gsTokenClient.callback = function(response){
-    if(response.error){toast('Erro de autenticação Google: '+response.error,'err'); return;}
-    gsAccessToken = response.access_token;
-    gsTokenExpiry = Date.now() + (response.expires_in||3600)*1000;
-    toast('✅ Autenticado com Google Sheets!');
-    gsUpdateStatusWidget();
-    gsStartAutoSync();
-    if(callback) callback();
-  };
-  gsTokenClient.requestAccessToken({prompt:''});
-}
-
-async function gsFetchRange(range){
-  const cfg = gsLoadConfig();
-  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
-  let url = `${GS_API_BASE}/${id}/values/${range}`;
-  const opts = {headers:{}};
-  if(gsIsAuthenticated()){
-    opts.headers['Authorization'] = `Bearer ${gsAccessToken}`;
-  } else if(cfg.apiKey){
-    url += `?key=${encodeURIComponent(cfg.apiKey)}`;
-  } else {
-    throw new Error('Sem autenticação. Configure Client ID ou API Key.');
-  }
-  const res = await fetch(url, opts);
-  if(!res.ok){const t=await res.text(); throw new Error(`API ${res.status}: ${t.slice(0,300)}`);}
-  return res.json();
-}
-
-async function gsWriteRange(range, values){
-  if(!gsIsAuthenticated()) throw new Error('Não autenticado. Clique em Autenticar primeiro.');
-  const cfg = gsLoadConfig();
-  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
-  const url = `${GS_API_BASE}/${id}/values/${range}?valueInputOption=USER_ENTERED`;
-  const res = await fetch(url,{
-    method:'PUT',
-    headers:{'Authorization':`Bearer ${gsAccessToken}`,'Content-Type':'application/json'},
-    body:JSON.stringify({range, majorDimension:'ROWS', values}),
-  });
-  if(!res.ok){const t=await res.text(); throw new Error(`Write ${res.status}: ${t.slice(0,300)}`);}
-  return res.json();
-}
-
-async function gsClearRange(range){
-  if(!gsIsAuthenticated()) throw new Error('Não autenticado.');
-  const cfg = gsLoadConfig();
-  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
-  const url = `${GS_API_BASE}/${id}/values/${range}:clear`;
-  const res = await fetch(url,{
-    method:'POST',
-    headers:{'Authorization':`Bearer ${gsAccessToken}`,'Content-Type':'application/json'},
-    body:'{}',
-  });
-  if(!res.ok){const t=await res.text(); throw new Error(`Clear ${res.status}: ${t.slice(0,200)}`);}
-}
-
-async function gsGetSheetNames(){
-  const cfg = gsLoadConfig();
-  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
-  let url = `${GS_API_BASE}/${id}?fields=sheets.properties.title`;
-  const opts = {headers:{}};
-  if(gsIsAuthenticated()) opts.headers['Authorization'] = `Bearer ${gsAccessToken}`;
-  else if(cfg.apiKey) url += `&key=${encodeURIComponent(cfg.apiKey)}`;
-  const res = await fetch(url, opts);
-  if(!res.ok){const t=await res.text(); throw new Error(`Metadata ${res.status}: ${t.slice(0,200)}`);}
+  const base = (cfg.webAppUrl||'').trim();
+  if(!base) throw new Error('URL do Web App não configurada. Vá em Administração → Google Sheets.');
+  const url = base + (base.includes('?')?'&':'?') + 'sheet=' + encodeURIComponent(sheet);
+  const res = await fetch(url, {redirect:'follow'});
+  if(!res.ok){ const t=await res.text(); throw new Error(`GET ${res.status}: ${t.slice(0,200)}`); }
   const data = await res.json();
-  return (data.sheets||[]).map(s=>s.properties.title);
+  if(data.error) throw new Error('Apps Script: ' + data.error);
+  return data; // {values: [[...]]}
 }
+
+async function gasPost(sheet, values, startRow){
+  const cfg = gsLoadConfig();
+  const base = (cfg.webAppUrl||'').trim();
+  if(!base) throw new Error('URL do Web App não configurada.');
+  const body = {sheet, values, startRow: startRow||1};
+  if(cfg.webAppToken) body.token = cfg.webAppToken;
+  const res = await fetch(base, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+    redirect:'follow',
+  });
+  if(!res.ok){ const t=await res.text(); throw new Error(`POST ${res.status}: ${t.slice(0,200)}`); }
+  const data = await res.json();
+  if(data.error) throw new Error('Apps Script: ' + data.error);
+  return data;
+}
+
+async function gasListSheets(){
+  const cfg = gsLoadConfig();
+  const base = (cfg.webAppUrl||'').trim();
+  if(!base) throw new Error('URL do Web App não configurada.');
+  const url = base + (base.includes('?')?'&':'?') + 'action=list';
+  const res = await fetch(url, {redirect:'follow'});
+  if(!res.ok){ const t=await res.text(); throw new Error(`List ${res.status}: ${t.slice(0,200)}`); }
+  const data = await res.json();
+  if(data.error) throw new Error('Apps Script: ' + data.error);
+  return data.sheets || [];
+}
+
+// Legacy aliases used by read-only context (keep gsGetSheetNames working)
+async function gsGetSheetNames(){ return gasListSheets(); }
 
 function gsObjsToRows(arr, skipCols){
   if(!arr||!arr.length) return [[]];
@@ -3511,7 +3460,7 @@ async function gsImportPols(){
   for(const [tipo,cfg] of Object.entries(GS_POL_CFG)){
     const shName = gsGetPolSheetName(tipo);
     try{
-      const data = await gsFetchRange(`${shName}!A:Z`);
+      const data = await gasGet(shName);
       if(!data.values||data.values.length<=cfg.headerRow) {
         console.warn(`[Sheets] Pol "${shName}": sem dados`); continue;
       }
@@ -3536,10 +3485,10 @@ async function gsExportPols(){
     const arr = POLS.filter(r=>r.TIPO===tipo);
     const shName = gsGetPolSheetName(tipo);
     try{
-      // Fetch existing header to preserve exact column names and title rows
-      const meta = await gsFetchRange(`${shName}!A1:Z${polCfg.headerRow}`);
-      const titleRows = (meta.values||[]).slice(0, polCfg.headerRow-1);
-      const headerRow = (meta.values||[])[polCfg.headerRow-1]||[];
+      // Fetch existing header rows to preserve exact column names and title rows
+      const meta = await gasGet(shName);
+      const metaRows = meta.values||[];
+      const headerRow = metaRows[polCfg.headerRow-1]||[];
       const headers = headerRow.filter(Boolean);
       if(!headers.length) { console.warn(`[Sheets] Pol export "${shName}": sem cabeçalho`); continue; }
 
@@ -3552,12 +3501,9 @@ async function gsExportPols(){
         return (v===null||v===undefined)?'':String(v);
       }));
 
-      // Write: clear data area, then write data rows
+      // Write from first data row, preserving title rows above
       const dataStart = polCfg.headerRow+1;
-      await gsClearRange(`${shName}!A${dataStart}:Z9999`);
-      if(dataRows.length){
-        await gsWriteRange(`${shName}!A${dataStart}`, dataRows);
-      }
+      await gasPost(shName, dataRows, dataStart);
       exported++;
       console.log(`[Sheets] ⬆ "${shName}" (${tipo}): ${dataRows.length} registros`);
     } catch(e){
@@ -3605,127 +3551,167 @@ const GS_SHEETS = [
 ];
 
 async function gsSyncFrom(){
+  if(!gsIsReady()){ toast('Configure a URL do Web App em Administração → Google Sheets.','err'); return; }
   const btn=document.getElementById('gs-btn-import');
   if(btn) btn.disabled=true;
-  gsAuth(async function(){
-    try{
-      toast('⏳ Importando dados do Google Sheets…');
-      const cfg = gsLoadConfig();
-      const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
-      let imported=0, skipped=0;
+  try{
+    toast('⏳ Importando dados do Google Sheets…');
+    const cfg = gsLoadConfig();
+    const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
+    let imported=0, skipped=0;
 
-      for(const sheet of GS_SHEETS){
-        if(!selectedKeys.includes(sheet.key)) continue;
-        if(sheet.multiPol){
-          try{
-            const n = await gsImportPols();
-            if(n>0) imported++;
-            else skipped++;
-          } catch(e){ skipped++; console.warn('[Sheets] Pol import error:',e.message); }
-          continue;
-        }
-        const sheetName = gsGetSheetName(sheet.key);
-        const hr = sheet.headerRow||1;
+    for(const sheet of GS_SHEETS){
+      if(!selectedKeys.includes(sheet.key)) continue;
+      if(sheet.multiPol){
         try{
-          const data = await gsFetchRange(`${sheetName}!A:ZZ`);
-          if(data.values&&data.values.length>hr){
-            const objs = gsRowsToObjsMapped(data.values, hr);
-            if(objs.length){ sheet.setter(objs); imported++; console.log(`[Sheets] ⬇ "${sheetName}": ${objs.length} registros`); }
-            else { skipped++; console.warn(`[Sheets] "${sheetName}": sem dados válidos`); }
-          } else { skipped++; console.warn(`[Sheets] "${sheetName}": vazia ou não encontrada`); }
-        } catch(e){ skipped++; console.warn(`[Sheets] "${sheetName}": ${e.message}`); }
+          const n = await gsImportPols();
+          if(n>0) imported++;
+          else skipped++;
+        } catch(e){ skipped++; console.warn('[Sheets] Pol import error:',e.message); }
+        continue;
       }
+      const sheetName = gsGetSheetName(sheet.key);
+      const hr = sheet.headerRow||1;
+      try{
+        const data = await gasGet(sheetName);
+        if(data.values&&data.values.length>hr){
+          const objs = gsRowsToObjsMapped(data.values, hr);
+          if(objs.length){ sheet.setter(objs); imported++; console.log(`[Sheets] ⬇ "${sheetName}": ${objs.length} registros`); }
+          else { skipped++; console.warn(`[Sheets] "${sheetName}": sem dados válidos`); }
+        } else { skipped++; console.warn(`[Sheets] "${sheetName}": vazia ou não encontrada`); }
+      } catch(e){ skipped++; console.warn(`[Sheets] "${sheetName}": ${e.message}`); }
+    }
 
-      gsLastSync = new Date().toISOString();
-      localStorage.setItem('GS_LAST_SYNC', gsLastSync);
-      rebuildDashboard(); updateBadges(); gsUpdateStatusWidget();
-      toast(`✅ Importação: ${imported} tabelas importadas${skipped?' · '+skipped+' ignoradas':''}`);
-      admAddLog('Importou dados','sheets',`Sheets → Sistema (${imported} tabelas)`);
-      if(admTab==='sheets') admRenderContent();
-    } catch(e){ toast('Erro na importação: '+e.message,'err'); console.error('[Sheets] Import error',e); }
-    if(btn) btn.disabled=false;
-  });
+    gsLastSync = new Date().toISOString();
+    localStorage.setItem('GS_LAST_SYNC', gsLastSync);
+    rebuildDashboard(); updateBadges(); gsUpdateStatusWidget();
+    toast(`✅ Importação: ${imported} tabelas importadas${skipped?' · '+skipped+' ignoradas':''}`);
+    admAddLog('Importou dados','sheets',`Sheets → Sistema (${imported} tabelas)`);
+    if(admTab==='sheets') admRenderContent();
+  } catch(e){ toast('Erro na importação: '+e.message,'err'); console.error('[Sheets] Import error',e); }
+  if(btn) btn.disabled=false;
 }
 
 async function gsSyncTo(){
+  if(!gsIsReady()){ toast('Configure a URL do Web App em Administração → Google Sheets.','err'); return; }
   const btn=document.getElementById('gs-btn-export');
   if(btn) btn.disabled=true;
-  gsAuth(async function(){
-    try{
-      toast('⏳ Exportando dados para Google Sheets…');
-      const cfg = gsLoadConfig();
-      const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
-      let exported=0, failed=0;
+  try{
+    toast('⏳ Exportando dados para Google Sheets…');
+    const cfg = gsLoadConfig();
+    const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
+    let exported=0, failed=0;
 
-      for(const sheet of GS_SHEETS){
-        if(!selectedKeys.includes(sheet.key)) continue;
-        if(sheet.multiPol){
-          try{ exported += await gsExportPols(); }
-          catch(e){ failed++; console.warn('[Sheets] Pol export error:',e.message); }
-          continue;
-        }
-        const sheetName = gsGetSheetName(sheet.key);
-        const hr = sheet.headerRow||1;
-        try{
-          const arr = sheet.getter();
-          if(!arr||!arr.length){ console.warn(`[Sheets] "${sheetName}": vazio, pulando`); continue; }
-          // Preserve title rows (rows above header)
-          if(hr>1){
-            await gsClearRange(`${sheetName}!A${hr+1}:ZZ`);
-            const rows = gsObjsToRows(arr, []);
-            // rows[0] = headers, rows[1..n] = data — write header to row hr, data below
-            await gsWriteRange(`${sheetName}!A${hr}`, rows);
-          } else {
-            const rows = gsObjsToRows(arr, []);
-            await gsClearRange(`${sheetName}!A:ZZ`);
-            await gsWriteRange(`${sheetName}!A1`, rows);
-          }
-          exported++; console.log(`[Sheets] ⬆ "${sheetName}": ${arr.length} registros`);
-        } catch(e){ failed++; console.warn(`[Sheets] "${sheetName}": ${e.message}`); }
+    for(const sheet of GS_SHEETS){
+      if(!selectedKeys.includes(sheet.key)) continue;
+      if(sheet.multiPol){
+        try{ exported += await gsExportPols(); }
+        catch(e){ failed++; console.warn('[Sheets] Pol export error:',e.message); }
+        continue;
       }
-
-      gsLastSync = new Date().toISOString();
-      localStorage.setItem('GS_LAST_SYNC', gsLastSync);
-      gsUpdateStatusWidget();
-      toast(`✅ Exportação: ${exported} tabelas atualizadas${failed?' · '+failed+' com erro':''}`);
-      admAddLog('Exportou dados','sheets',`Sistema → Sheets (${exported} tabelas)`);
-      if(admTab==='sheets') admRenderContent();
-    } catch(e){ toast('Erro na exportação: '+e.message,'err'); console.error('[Sheets] Export error',e); }
-    if(btn) btn.disabled=false;
-  });
-}
-      toast('Erro na exportação: '+e.message,'err');
-      console.error('[Sheets] Export error',e);
+      const sheetName = gsGetSheetName(sheet.key);
+      const hr = sheet.headerRow||1;
+      try{
+        const arr = sheet.getter();
+        if(!arr||!arr.length){ console.warn(`[Sheets] "${sheetName}": vazio, pulando`); continue; }
+        const rows = gsObjsToRows(arr, []);
+        // startRow=hr: Apps Script will clear from hr and write header+data starting there
+        await gasPost(sheetName, rows, hr);
+        exported++; console.log(`[Sheets] ⬆ "${sheetName}": ${arr.length} registros`);
+      } catch(e){ failed++; console.warn(`[Sheets] "${sheetName}": ${e.message}`); }
     }
-    if(btn) btn.disabled=false;
-  });
+
+    gsLastSync = new Date().toISOString();
+    localStorage.setItem('GS_LAST_SYNC', gsLastSync);
+    gsUpdateStatusWidget();
+    toast(`✅ Exportação: ${exported} tabelas atualizadas${failed?' · '+failed+' com erro':''}`);
+    admAddLog('Exportou dados','sheets',`Sistema → Sheets (${exported} tabelas)`);
+    if(admTab==='sheets') admRenderContent();
+  } catch(e){ toast('Erro na exportação: '+e.message,'err'); console.error('[Sheets] Export error',e); }
+  if(btn) btn.disabled=false;
 }
 
 function gsUpdateStatusWidget(){
   const el = document.getElementById('gs-status-widget');
   if(!el) return;
-  const auth = gsIsAuthenticated();
+  const ready = gsIsReady();
   const lastSync = gsLastSync ? new Date(gsLastSync).toLocaleString('pt-BR') : null;
-  if(auth){
-    el.innerHTML = `<span style="font-size:10px;color:var(--green)">●</span><span style="font-size:11px;color:var(--text2)">${lastSync?'Sheets: '+lastSync:'Sheets conectado'}</span>`;
+  if(ready){
+    el.innerHTML = `<span style="font-size:10px;color:var(--green)">●</span><span style="font-size:11px;color:var(--text2)">${lastSync?'Sheets: '+lastSync:'Sheets configurado'}</span>`;
   } else {
-    el.innerHTML = `<button class="btn btn-sm" onclick="goto('admin');admSetTab('sheets')" title="Configurar Google Sheets" style="font-size:11px;gap:4px">🔗 Sheets</button>`;
+    el.innerHTML = `<button class="btn btn-sm" onclick="goto('admin');admSetTab('sheets')" title="Configurar Google Sheets" style="font-size:11px;gap:4px">🔗 Configurar Sheets</button>`;
   }
 }
 
 function admRenderSheets(el){
   const cfg = gsLoadConfig();
   const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
+  const ready = gsIsReady();
   const lastSync = gsLastSync ? new Date(gsLastSync).toLocaleString('pt-BR') : 'Nunca';
-  const auth = gsIsAuthenticated();
+
+  const GAS_CODE = `// ── SISTEMA MMC — Apps Script Web App ──────────────────────────────────────
+// Cole este código em Extensões → Apps Script na sua planilha.
+// Depois clique em Implantar → Nova implantação → Aplicativo da Web
+// Executar como: Eu  |  Quem tem acesso: Qualquer pessoa
+// Copie a URL gerada e cole abaixo em "URL do Web App".
+
+const SECRET_TOKEN = '';  // Opcional: defina uma senha para proteger a escrita
+
+function doGet(e) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (e.parameter.action === 'list') {
+      const names = ss.getSheets().map(s => s.getName());
+      return jsonOut({ sheets: names });
+    }
+    const sheetName = e.parameter.sheet;
+    if (!sheetName) return jsonOut({ error: 'Parâmetro "sheet" ausente' });
+    const ws = ss.getSheetByName(sheetName);
+    if (!ws) return jsonOut({ error: 'Aba não encontrada: ' + sheetName });
+    const values = ws.getDataRange().getValues();
+    return jsonOut({ values: values });
+  } catch(err) {
+    return jsonOut({ error: err.message });
+  }
+}
+
+function doPost(e) {
+  try {
+    const payload = JSON.parse(e.postData.contents);
+    if (SECRET_TOKEN && payload.token !== SECRET_TOKEN)
+      return jsonOut({ error: 'Token inválido' });
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheetName = payload.sheet;
+    const values = payload.values;
+    const startRow = payload.startRow || 1;
+    if (!sheetName || !values) return jsonOut({ error: 'Campos obrigatórios: sheet, values' });
+    const ws = ss.getSheetByName(sheetName);
+    if (!ws) return jsonOut({ error: 'Aba não encontrada: ' + sheetName });
+    // Clear from startRow downwards, then write
+    const lastRow = ws.getLastRow();
+    if (lastRow >= startRow) ws.getRange(startRow, 1, lastRow - startRow + 1, ws.getMaxColumns()).clearContent();
+    if (values.length > 0) {
+      ws.getRange(startRow, 1, values.length, values[0].length).setValues(values);
+    }
+    return jsonOut({ ok: true, rows: values.length });
+  } catch(err) {
+    return jsonOut({ error: err.message });
+  }
+}
+
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}`;
+
   el.innerHTML = `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
       <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:20px">
-        <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔗 Status da Conexão</div>
+        <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔗 Status</div>
         <div style="display:flex;flex-direction:column;gap:10px;font-size:12px">
           <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text2)">Autenticado:</span>
-            <span style="color:${auth?'var(--green)':'var(--red)'};font-weight:600">${auth?'✅ Sim':'❌ Não'}</span>
+            <span style="color:var(--text2)">Web App configurado:</span>
+            <span style="color:${ready?'var(--green)':'var(--red)'};font-weight:600">${ready?'✅ Sim':'❌ Não'}</span>
           </div>
           <div style="display:flex;justify-content:space-between">
             <span style="color:var(--text2)">Sincronização automática:</span>
@@ -3736,19 +3722,13 @@ function admRenderSheets(el){
             <span style="font-family:var(--mono);font-size:11px">${esc(lastSync)}</span>
           </div>
           <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text2)">ID da Planilha:</span>
-            <a href="https://docs.google.com/spreadsheets/d/${esc(id)}/edit" target="_blank" style="font-family:var(--mono);font-size:10px;color:var(--blue);text-decoration:none;overflow:hidden;text-overflow:ellipsis;max-width:180px;display:inline-block">${esc(id.slice(0,22))}…</a>
+            <span style="color:var(--text2)">Planilha:</span>
+            <a href="https://docs.google.com/spreadsheets/d/${esc(id)}/edit" target="_blank" style="font-family:var(--mono);font-size:10px;color:var(--blue);text-decoration:none">${esc(id.slice(0,22))}…</a>
           </div>
-        </div>
-        <div style="margin-top:14px;display:flex;gap:8px">
-          ${!auth
-            ? `<button class="btn btn-primary" onclick="gsAuth()" style="flex:1">🔐 Autenticar Google</button>`
-            : `<button class="btn" onclick="gsAccessToken=null;if(gsAutoSyncTimer){clearInterval(gsAutoSyncTimer);gsAutoSyncTimer=null;}gsUpdateStatusWidget();admRenderContent()" style="flex:1">🔓 Desconectar</button>`
-          }
         </div>
       </div>
       <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:20px">
-        <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚡ Sincronização Manual</div>
+        <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚡ Sincronização</div>
         <div style="display:flex;flex-direction:column;gap:10px">
           <button id="gs-btn-import" class="btn btn-primary" onclick="gsSyncFrom()" style="width:100%;justify-content:center">⬇️ Importar do Google Sheets</button>
           <button id="gs-btn-export" class="btn" onclick="gsSyncTo()" style="width:100%;justify-content:center">⬆️ Exportar para Google Sheets</button>
@@ -3757,31 +3737,42 @@ function admRenderSheets(el){
         </div>
       </div>
     </div>
+
+    <!-- STEP 1: Apps Script code -->
+    <div style="background:var(--bg2);border:1px solid rgba(210,153,34,.4);border-radius:var(--rl);padding:20px;margin-bottom:16px">
+      <div style="font-size:14px;font-weight:600;color:var(--amber);margin-bottom:8px">📋 Passo 1 — Cole este código na sua planilha</div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:12px">
+        Na planilha Google Sheets, clique em <strong style="color:var(--text)">Extensões → Apps Script</strong>, apague o conteúdo e cole o código abaixo. Depois clique em 
+        <strong style="color:var(--text)">Implantar → Nova implantação → Aplicativo da Web</strong> (Executar como: Eu · Acesso: Qualquer pessoa). Copie a URL gerada.
+      </div>
+      <div style="position:relative">
+        <textarea readonly onclick="this.select()" style="width:100%;height:220px;font-family:var(--mono);font-size:11px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:12px;color:var(--text);resize:vertical;box-sizing:border-box">${GAS_CODE.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea>
+        <button class="btn btn-sm" onclick="navigator.clipboard.writeText(document.querySelector('#adm-content textarea').value);toast('Código copiado!')" style="position:absolute;top:8px;right:8px">📋 Copiar</button>
+      </div>
+    </div>
+
+    <!-- STEP 2: Paste Web App URL -->
     <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--rl);padding:20px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚙️ Configurações</div>
+      <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔧 Passo 2 — Configurações</div>
       <div class="form-grid">
         <div class="fg s2">
-          <label class="form-label">ID da Planilha (Spreadsheet ID)</label>
-          <input class="form-input" id="gs-cfg-id" value="${esc(id)}" placeholder="1iEXnpHQ7jKWiEkNYY...">
+          <label class="form-label">URL do Web App <span style="color:var(--red)">*</span> <span style="font-size:10px;color:var(--text3)">(cole aqui a URL gerada após implantar o Apps Script)</span></label>
+          <input class="form-input" id="gs-cfg-webapp" value="${esc(cfg.webAppUrl||'')}" placeholder="https://script.google.com/macros/s/XXXXXXXXXX/exec">
         </div>
         <div class="fg">
-          <label class="form-label">Google OAuth Client ID <span style="color:var(--red)">*</span></label>
-          <input class="form-input" id="gs-cfg-clientid" value="${esc(cfg.clientId||'')}" placeholder="000000.apps.googleusercontent.com">
-        </div>
-        <div class="fg">
-          <label class="form-label">API Key (leitura sem login, opcional)</label>
-          <input class="form-input" id="gs-cfg-apikey" value="${esc(cfg.apiKey||'')}" placeholder="AIzaSy...">
+          <label class="form-label">Token secreto <span style="font-size:10px;color:var(--text3)">(opcional — deve ser igual ao SECRET_TOKEN no código acima)</span></label>
+          <input class="form-input" id="gs-cfg-token" value="${esc(cfg.webAppToken||'')}" placeholder="Deixe em branco se não configurou">
         </div>
         <div class="fg">
           <label class="form-label">Sincronização Automática Bidirecional</label>
           <div style="display:flex;align-items:center;gap:10px;padding:8px 0">
             <input type="checkbox" id="gs-cfg-autosync" ${cfg.autoSync?'checked':''} style="width:16px;height:16px;cursor:pointer;accent-color:var(--blue)">
-            <span style="font-size:12px;color:var(--text2)">Ativar sincronização automática<br><span style="font-size:11px;color:var(--text3)">Mudanças no sistema são enviadas para Sheets automaticamente. Sheets é verificado periodicamente.</span></span>
+            <span style="font-size:12px;color:var(--text2)">Ativar<br><span style="font-size:11px;color:var(--text3)">Edições no sistema são enviadas automaticamente. A planilha é verificada no intervalo abaixo.</span></span>
           </div>
         </div>
         <div class="fg">
-          <label class="form-label">Intervalo de verificação de Sheets (minutos)</label>
-          <input class="form-input" id="gs-cfg-interval" type="number" min="1" max="60" value="${cfg.syncInterval||5}" placeholder="5">
+          <label class="form-label">Intervalo de verificação da planilha (minutos)</label>
+          <input class="form-input" id="gs-cfg-interval" type="number" min="1" max="60" value="${cfg.syncInterval||5}">
         </div>
       </div>
       <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin:16px 0 8px">Nomes das Abas — Dados Gerais</div>
@@ -3803,67 +3794,43 @@ function admRenderSheets(el){
       <div style="margin-top:14px">
         <button class="btn btn-primary" onclick="gsSaveConfigForm()">💾 Salvar Configurações</button>
       </div>
-    </div>
-    <div style="background:var(--blue-d);border:1px solid rgba(56,139,253,.25);border-radius:var(--rl);padding:18px">
-      <div style="font-size:13px;font-weight:600;color:var(--blue);margin-bottom:10px">ℹ️ Como configurar a sincronização bidirecional</div>
-      <ol style="font-size:12px;color:var(--text2);margin:0;padding-left:18px;line-height:1.9">
-        <li>Acesse o <a href="https://console.cloud.google.com" target="_blank" style="color:var(--blue)">Google Cloud Console</a> e crie ou selecione um projeto</li>
-        <li>Ative a <strong style="color:var(--text)">Google Sheets API</strong> em <em>APIs e Serviços</em></li>
-        <li>Em <em>Credenciais</em>, crie um <strong style="color:var(--text)">ID do Cliente OAuth 2.0</strong> do tipo <em>Aplicativo Web</em></li>
-        <li>Adicione a URL desta página em <em>Origens JavaScript Autorizadas</em></li>
-        <li>Cole o <strong style="color:var(--text)">Client ID</strong> acima, ative <strong style="color:var(--text)">Sincronização Automática</strong> e clique em <strong>Salvar Configurações</strong></li>
-        <li>Verifique os nomes das abas (use <em>Listar Abas</em>) e ajuste se necessário</li>
-        <li>Clique em <strong style="color:var(--text)">Autenticar Google</strong> — a sincronização bidirecional começará automaticamente</li>
-      </ol>
-      <div style="margin-top:10px;padding:10px 12px;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.25);border-radius:var(--r);font-size:12px;color:var(--green)">
-        ✅ <strong>Sincronização bidirecional ativa:</strong> Qualquer edição feita no sistema é enviada automaticamente para a planilha Google Sheets. Alterações feitas diretamente na planilha são detectadas a cada intervalo configurado e aplicadas ao sistema.
-      </div>
     </div>`;
+}
 }
 
 function gsSaveConfigForm(){
-  const id = (document.getElementById('gs-cfg-id')?.value||'').trim();
-  const clientId = (document.getElementById('gs-cfg-clientid')?.value||'').trim();
-  const apiKey = (document.getElementById('gs-cfg-apikey')?.value||'').trim();
+  const webAppUrl = (document.getElementById('gs-cfg-webapp')?.value||'').trim();
+  const webAppToken = (document.getElementById('gs-cfg-token')?.value||'').trim();
   const autoSync = document.getElementById('gs-cfg-autosync')?.checked||false;
   const syncInterval = parseInt(document.getElementById('gs-cfg-interval')?.value||'5')||5;
   const sheetNames = {};
-  // Non-politician sheets
   document.querySelectorAll('[data-gs-sheet]').forEach(el=>{sheetNames[el.dataset.gsSheet]=el.value.trim();});
-  // Politician sub-sheets
   document.querySelectorAll('[data-gs-pol]').forEach(el=>{sheetNames['pol_'+el.dataset.gsPol]=el.value.trim();});
-  gsSaveConfig({spreadsheetId:id||GS_SPREADSHEET_ID, clientId, apiKey, autoSync, syncInterval, sheetNames});
-  gsTokenClient = null;
-  gsInitTokenClient();
+  gsSaveConfig({spreadsheetId:GS_SPREADSHEET_ID, webAppUrl, webAppToken, autoSync, syncInterval, sheetNames});
   gsStartAutoSync();
   toast('✅ Configurações salvas!');
   admRenderContent();
 }
 
 async function gsListSheets(){
-  const doList = async function(){
-    try{
-      const sheets = await gsGetSheetNames();
-      document.getElementById('modal-title').textContent = 'Abas da Planilha';
-      document.getElementById('modal-body').innerHTML = `
-        <div style="font-size:13px;color:var(--text2);margin-bottom:14px">Abas encontradas na planilha Google Sheets:</div>
-        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
-          ${sheets.map(s=>`<span class="badge bg" style="font-size:12px;padding:4px 10px">${esc(s)}</span>`).join('')}
-        </div>
-        <div style="font-size:12px;color:var(--text3)">Configure os nomes das abas na aba de configurações acima para que correspondam exatamente.</div>`;
-      document.getElementById('modal-foot').innerHTML = `<button class="btn" onclick="closeModal()">Fechar</button>`;
-      document.getElementById('modal').classList.add('open');
-    } catch(e){
-      toast('Erro ao listar abas: '+e.message,'err');
-    }
-  };
-  if(gsIsAuthenticated()){await doList();}
-  else{gsAuth(doList);}
+  if(!gsIsReady()){ toast('Configure a URL do Web App primeiro.','err'); return; }
+  try{
+    const sheets = await gsGetSheetNames();
+    document.getElementById('modal-title').textContent = 'Abas da Planilha';
+    document.getElementById('modal-body').innerHTML = `
+      <div style="font-size:13px;color:var(--text2);margin-bottom:14px">Abas encontradas na planilha Google Sheets:</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+        ${sheets.map(s=>`<span class="badge bg" style="font-size:12px;padding:4px 10px">${esc(s)}</span>`).join('')}
+      </div>
+      <div style="font-size:12px;color:var(--text3)">Configure os nomes das abas na aba de configurações acima para que correspondam exatamente.</div>`;
+    document.getElementById('modal-foot').innerHTML = `<button class="btn" onclick="closeModal()">Fechar</button>`;
+    document.getElementById('modal').classList.add('open');
+  } catch(e){ toast('Erro ao listar abas: '+e.message,'err'); }
 }
 
 // ── GS: SINGLE-TABLE PUSH (system → Sheets) ──────────────────────────────────
 async function gsSyncTableTo(key){
-  if(!gsIsAuthenticated()) return;
+  if(!gsIsReady()) return;
   if(key==='politicos'){
     try{ await gsExportPols(); gsLastSync=new Date().toISOString(); localStorage.setItem('GS_LAST_SYNC',gsLastSync); gsUpdateStatusWidget(); }
     catch(e){ console.warn('[Sheets] Auto-push pols:',e.message); toast('⚠️ Sheets: erro ao enviar Políticos','err'); }
@@ -3876,15 +3843,8 @@ async function gsSyncTableTo(key){
   try{
     const arr = sheet.getter();
     if(!arr||!arr.length) return;
-    if(hr>1){
-      await gsClearRange(`${sheetName}!A${hr+1}:ZZ`);
-      const rows = gsObjsToRows(arr,[]);
-      await gsWriteRange(`${sheetName}!A${hr}`, rows);
-    } else {
-      const rows = gsObjsToRows(arr,[]);
-      await gsClearRange(`${sheetName}!A:ZZ`);
-      await gsWriteRange(`${sheetName}!A1`, rows);
-    }
+    const rows = gsObjsToRows(arr,[]);
+    await gasPost(sheetName, rows, hr);
     gsLastSync = new Date().toISOString();
     localStorage.setItem('GS_LAST_SYNC', gsLastSync);
     gsUpdateStatusWidget();
@@ -3899,7 +3859,7 @@ async function gsSyncTableTo(key){
 const gsPushTimers = {};
 function gsPushTable(key){
   const cfg = gsLoadConfig();
-  if(!cfg.autoSync||!gsIsAuthenticated()) return;
+  if(!cfg.autoSync||!gsIsReady()) return;
   if(gsPushTimers[key]) clearTimeout(gsPushTimers[key]);
   gsPushTimers[key] = setTimeout(()=>{ delete gsPushTimers[key]; gsSyncTableTo(key); }, 800);
 }
@@ -3907,7 +3867,7 @@ function gsPushTable(key){
 // ── GS: PERIODIC PULL (Sheets → system) ──────────────────────────────────────
 const gsLastSheetHash = {};
 async function gsAutoImport(){
-  if(!gsIsAuthenticated()) return;
+  if(!gsIsReady()) return;
   const cfg = gsLoadConfig();
   if(!cfg.autoSync) return;
   const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
@@ -3916,12 +3876,11 @@ async function gsAutoImport(){
   for(const sheet of GS_SHEETS){
     if(!selectedKeys.includes(sheet.key)) continue;
     if(sheet.multiPol){
-      // For politicians, poll each sub-sheet and check for changes
       let polChanged = false;
       for(const [tipo,polCfg] of Object.entries(GS_POL_CFG)){
         const shName = gsGetPolSheetName(tipo);
         try{
-          const data = await gsFetchRange(`${shName}!A:Z`);
+          const data = await gasGet(shName);
           if(!data.values||data.values.length<=polCfg.headerRow) continue;
           const newHash = data.values.length+'|'+JSON.stringify(data.values.slice(polCfg.headerRow-1,polCfg.headerRow+2));
           if(gsLastSheetHash['pol_'+tipo]!==newHash){ gsLastSheetHash['pol_'+tipo]=newHash; polChanged=true; }
@@ -3933,7 +3892,7 @@ async function gsAutoImport(){
     const sheetName = gsGetSheetName(sheet.key);
     const hr = sheet.headerRow||1;
     try{
-      const data = await gsFetchRange(`${sheetName}!A:ZZ`);
+      const data = await gasGet(sheetName);
       if(!data.values||data.values.length<=hr) continue;
       const newHash = data.values.length+'|'+JSON.stringify(data.values.slice(hr-1,hr+2));
       if(gsLastSheetHash[sheet.key]!==newHash){
@@ -3970,18 +3929,10 @@ updateBadges();
 buildDashboard();
 updateCurrentUserWidget();
 gsUpdateStatusWidget();
-// Init GIS token client once the library loads
-if(typeof google !== 'undefined' && google.accounts) {
-  gsInitTokenClient();
-} else {
-  window.addEventListener('load', function(){
-    setTimeout(gsInitTokenClient, 500);
-  });
-}
-// Restart auto-sync timer if it was previously enabled
+// Restart auto-sync timer if it was previously enabled and Web App is configured
 (function(){
   const cfg = gsLoadConfig();
-  if(cfg.autoSync && cfg.clientId) gsStartAutoSync();
+  if(cfg.autoSync && cfg.webAppUrl) gsStartAutoSync();
 })();
 </script>
 </body>
