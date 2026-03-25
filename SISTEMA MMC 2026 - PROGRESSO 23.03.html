@@ -953,6 +953,7 @@ function saveRecord() {
     }
     closeModal(); renderPoliticos(); updateBadges();
     gsPushTable('politicos');
+  } else if(mMode==='aniv') {
     const inputs = document.querySelectorAll('#modal-body [data-key]');
     const rec = {};
     inputs.forEach(el=>{
