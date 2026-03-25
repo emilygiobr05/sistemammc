@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Planilha Master — Rondônia</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -251,7 +252,8 @@ tbody td{padding:8px 11px;vertical-align:middle}
       <div class="topbar-title" id="topbar-title">Dashboard</div>
       <div class="topbar-sub" id="topbar-sub">Visão geral — Rondônia</div>
     </div>
-    <div style="display:flex;align-items:center">
+    <div style="display:flex;align-items:center;gap:6px">
+      <div id="gs-status-widget" style="display:flex;align-items:center;gap:6px;margin-right:4px"></div>
       <div class="cur-user-widget" id="adm-cur-user">
         <button class="btn btn-sm" onclick="admSwitchUser()">👤 Entrar como</button>
       </div>
@@ -2935,6 +2937,7 @@ function renderAdmin(){
       <button class="tab ${admTab==='users'?'on':''}" onclick="admSetTab('users')">👤 Usuários (${users.length})</button>
       <button class="tab ${admTab==='logs'?'on':''}" onclick="admSetTab('logs')">📋 Logs de Atividade</button>
       <button class="tab ${admTab==='backup'?'on':''}" onclick="admSetTab('backup')">💾 Backup</button>
+      <button class="tab ${admTab==='sheets'?'on':''}" onclick="admSetTab('sheets')">🔗 Google Sheets</button>
     </div>
     <div id="adm-content"></div>`;
   admRenderContent();
@@ -2946,6 +2949,7 @@ function admRenderContent(){
   if(!el)return;
   if(admTab==='users')admRenderUsers(el);
   else if(admTab==='backup')admRenderBackup(el);
+  else if(admTab==='sheets')admRenderSheets(el);
   else admRenderLogs(el);
 }
 
@@ -3275,10 +3279,429 @@ function admRenderBackup(el){
     </div>`;
 }
 
+// ── GOOGLE SHEETS SYNC ───────────────────────────────────────────────────────
+const GS_SPREADSHEET_ID = '1iEXnpHQ7jKWiEkNYYsSOtFFNvXdj_O5d8yv4uj9yrDU';
+const GS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
+let gsAccessToken = null;
+let gsTokenExpiry = 0;
+let gsTokenClient = null;
+let gsLastSync = localStorage.getItem('GS_LAST_SYNC') || null;
+
+function gsLoadConfig(){try{return JSON.parse(localStorage.getItem('GS_CONFIG')||'{}');}catch(e){return{};}}
+function gsSaveConfig(cfg){localStorage.setItem('GS_CONFIG',JSON.stringify(cfg));}
+function gsIsAuthenticated(){return !!(gsAccessToken && Date.now() < gsTokenExpiry - 30000);}
+
+function gsInitTokenClient(){
+  const cfg = gsLoadConfig();
+  if(!cfg.clientId) return null;
+  if(typeof google === 'undefined' || !google.accounts || !google.accounts.oauth2) return null;
+  gsTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: cfg.clientId,
+    scope: 'https://www.googleapis.com/auth/spreadsheets',
+    callback: '',
+  });
+  return gsTokenClient;
+}
+
+function gsAuth(callback){
+  if(gsIsAuthenticated()){if(callback) callback(); return;}
+  const cfg = gsLoadConfig();
+  if(!cfg.clientId){
+    toast('Configure o Client ID OAuth nas configurações de Google Sheets (Administração → Google Sheets).','err');
+    return;
+  }
+  if(!gsTokenClient) gsInitTokenClient();
+  if(!gsTokenClient){
+    toast('Biblioteca Google Identity Services ainda não carregou. Aguarde e tente novamente.','err');
+    return;
+  }
+  gsTokenClient.callback = function(response){
+    if(response.error){toast('Erro de autenticação Google: '+response.error,'err'); return;}
+    gsAccessToken = response.access_token;
+    gsTokenExpiry = Date.now() + (response.expires_in||3600)*1000;
+    toast('✅ Autenticado com Google Sheets!');
+    gsUpdateStatusWidget();
+    if(callback) callback();
+  };
+  gsTokenClient.requestAccessToken({prompt:''});
+}
+
+async function gsFetchRange(range){
+  const cfg = gsLoadConfig();
+  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
+  let url = `${GS_API_BASE}/${id}/values/${range}`;
+  const opts = {headers:{}};
+  if(gsIsAuthenticated()){
+    opts.headers['Authorization'] = `Bearer ${gsAccessToken}`;
+  } else if(cfg.apiKey){
+    url += `?key=${encodeURIComponent(cfg.apiKey)}`;
+  } else {
+    throw new Error('Sem autenticação. Configure Client ID ou API Key.');
+  }
+  const res = await fetch(url, opts);
+  if(!res.ok){const t=await res.text(); throw new Error(`API ${res.status}: ${t.slice(0,300)}`);}
+  return res.json();
+}
+
+async function gsWriteRange(range, values){
+  if(!gsIsAuthenticated()) throw new Error('Não autenticado. Clique em Autenticar primeiro.');
+  const cfg = gsLoadConfig();
+  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
+  const url = `${GS_API_BASE}/${id}/values/${range}?valueInputOption=USER_ENTERED`;
+  const res = await fetch(url,{
+    method:'PUT',
+    headers:{'Authorization':`Bearer ${gsAccessToken}`,'Content-Type':'application/json'},
+    body:JSON.stringify({range, majorDimension:'ROWS', values}),
+  });
+  if(!res.ok){const t=await res.text(); throw new Error(`Write ${res.status}: ${t.slice(0,300)}`);}
+  return res.json();
+}
+
+async function gsClearRange(range){
+  if(!gsIsAuthenticated()) throw new Error('Não autenticado.');
+  const cfg = gsLoadConfig();
+  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
+  const url = `${GS_API_BASE}/${id}/values/${range}:clear`;
+  const res = await fetch(url,{
+    method:'POST',
+    headers:{'Authorization':`Bearer ${gsAccessToken}`,'Content-Type':'application/json'},
+    body:'{}',
+  });
+  if(!res.ok){const t=await res.text(); throw new Error(`Clear ${res.status}: ${t.slice(0,200)}`);}
+}
+
+async function gsGetSheetNames(){
+  const cfg = gsLoadConfig();
+  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
+  let url = `${GS_API_BASE}/${id}?fields=sheets.properties.title`;
+  const opts = {headers:{}};
+  if(gsIsAuthenticated()) opts.headers['Authorization'] = `Bearer ${gsAccessToken}`;
+  else if(cfg.apiKey) url += `&key=${encodeURIComponent(cfg.apiKey)}`;
+  const res = await fetch(url, opts);
+  if(!res.ok){const t=await res.text(); throw new Error(`Metadata ${res.status}: ${t.slice(0,200)}`);}
+  const data = await res.json();
+  return (data.sheets||[]).map(s=>s.properties.title);
+}
+
+function gsObjsToRows(arr, skipCols){
+  if(!arr||!arr.length) return [[]];
+  const skip = new Set(['_id','_origem','_foto'].concat(skipCols||[]));
+  const headers = Object.keys(arr[0]).filter(k=>!skip.has(k));
+  const rows = [headers, ...arr.map(r=>headers.map(h=>{
+    const v = r[h];
+    if(v===null||v===undefined) return '';
+    return String(v);
+  }))];
+  return rows;
+}
+
+function gsRowsToObjs(rows){
+  if(!rows||rows.length<2) return [];
+  const headers = rows[0];
+  return rows.slice(1).filter(row=>row.some(v=>v!==''&&v!==null&&v!==undefined)).map(row=>{
+    const obj = {};
+    headers.forEach((h,i)=>{
+      const v = row[i]??'';
+      if(v!==''&&!isNaN(v)&&!isNaN(parseFloat(v))){
+        obj[h] = parseFloat(v)%1===0?parseInt(v,10):parseFloat(v);
+      } else {
+        obj[h] = v===''?null:v;
+      }
+    });
+    return obj;
+  });
+}
+
+function gsGetSheetName(key){
+  const cfg = gsLoadConfig();
+  const def = GS_SHEETS.find(s=>s.key===key);
+  return (cfg.sheetNames&&cfg.sheetNames[key])||(def&&def.defaultSheet)||key;
+}
+
+const GS_SHEETS = [
+  {
+    label:'Políticos', key:'politicos', defaultSheet:'politicos',
+    getter:()=>POLS, skipCols:['_foto'],
+    setter(objs){
+      const photoMap={};
+      POLS.forEach(r=>{if(r._foto&&r.NOME) photoMap[r.NOME]=r._foto;});
+      POLS.length=0;
+      objs.forEach((r,i)=>POLS.push({_id:i,_origem:'sheets',_foto:photoMap[r.NOME]||null,...r}));
+      window.POLS_DATA=POLS;
+    }
+  },
+  {
+    label:'Emendas', key:'emendas', defaultSheet:'emendas',
+    getter:()=>DB.emendas,
+    setter(objs){
+      DB.emendas.length=0;
+      objs.forEach((r,i)=>DB.emendas.push({_id:i,...r}));
+      if(window.RAW_DATA) window.RAW_DATA.emendas=DB.emendas;
+    }
+  },
+  {
+    label:'Solicitações', key:'solicitacoes', defaultSheet:'solicitacoes',
+    getter:()=>DB.solicitacoes,
+    setter(objs){
+      DB.solicitacoes.length=0;
+      objs.forEach((r,i)=>DB.solicitacoes.push({_id:i,...r}));
+      if(window.RAW_DATA) window.RAW_DATA.solicitacoes=DB.solicitacoes;
+    }
+  },
+  {
+    label:'Municípios', key:'municipios', defaultSheet:'municipios',
+    getter:()=>DB.municipios,
+    setter(objs){
+      DB.municipios.length=0;
+      objs.forEach((r,i)=>DB.municipios.push({_id:i,...r}));
+      if(window.RAW_DATA) window.RAW_DATA.municipios=DB.municipios;
+    }
+  },
+  {
+    label:'Resumo', key:'resumo', defaultSheet:'resumo',
+    getter:()=>DB.resumo,
+    setter(objs){
+      DB.resumo.length=0;
+      objs.forEach((r,i)=>DB.resumo.push({_id:i,...r}));
+      if(window.RAW_DATA) window.RAW_DATA.resumo=DB.resumo;
+    }
+  },
+  {
+    label:'Aniversariantes', key:'aniversariantes', defaultSheet:'aniversariantes',
+    getter:()=>ANIV,
+    setter(objs){
+      ANIV.length=0;
+      objs.forEach((r,i)=>ANIV.push({_id:i,...r}));
+      anivSave(ANIV);
+    }
+  },
+];
+
+async function gsSyncFrom(){
+  const btn=document.getElementById('gs-btn-import');
+  if(btn) btn.disabled=true;
+  gsAuth(async function(){
+    try{
+      toast('⏳ Importando dados do Google Sheets…');
+      const cfg = gsLoadConfig();
+      const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
+      let imported=0, skipped=0;
+      for(const sheet of GS_SHEETS){
+        if(!selectedKeys.includes(sheet.key)) continue;
+        const sheetName = gsGetSheetName(sheet.key);
+        try{
+          const data = await gsFetchRange(`${sheetName}!A:ZZ`);
+          if(data.values&&data.values.length>1){
+            const objs = gsRowsToObjs(data.values);
+            sheet.setter(objs);
+            imported++;
+            console.log(`[Sheets] Importado "${sheetName}": ${objs.length} registros`);
+          } else {
+            skipped++;
+            console.warn(`[Sheets] Aba "${sheetName}" vazia ou não encontrada`);
+          }
+        } catch(e){
+          skipped++;
+          console.warn(`[Sheets] Falha "${sheetName}": ${e.message}`);
+        }
+      }
+      gsLastSync = new Date().toISOString();
+      localStorage.setItem('GS_LAST_SYNC', gsLastSync);
+      rebuildDashboard();
+      updateBadges();
+      gsUpdateStatusWidget();
+      toast(`✅ Importação concluída: ${imported} abas importadas${skipped?' · '+skipped+' ignoradas':''}`);
+      admAddLog('Importou dados','sheets',`Google Sheets → Sistema (${imported} abas)`);
+      if(admTab==='sheets') admRenderContent();
+    } catch(e){
+      toast('Erro na importação: '+e.message,'err');
+      console.error('[Sheets] Import error',e);
+    }
+    if(btn) btn.disabled=false;
+  });
+}
+
+async function gsSyncTo(){
+  const btn=document.getElementById('gs-btn-export');
+  if(btn) btn.disabled=true;
+  gsAuth(async function(){
+    try{
+      toast('⏳ Exportando dados para Google Sheets…');
+      const cfg = gsLoadConfig();
+      const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
+      let exported=0, failed=0;
+      for(const sheet of GS_SHEETS){
+        if(!selectedKeys.includes(sheet.key)) continue;
+        const sheetName = gsGetSheetName(sheet.key);
+        try{
+          const arr = sheet.getter();
+          if(!arr||!arr.length){console.warn(`[Sheets] "${sheetName}" vazio, pulando`);continue;}
+          const rows = gsObjsToRows(arr, sheet.skipCols||[]);
+          await gsClearRange(`${sheetName}!A:ZZ`);
+          await gsWriteRange(`${sheetName}!A1`, rows);
+          exported++;
+          console.log(`[Sheets] Exportado "${sheetName}": ${rows.length-1} registros`);
+        } catch(e){
+          failed++;
+          console.warn(`[Sheets] Falha ao exportar "${sheetName}": ${e.message}`);
+        }
+      }
+      gsLastSync = new Date().toISOString();
+      localStorage.setItem('GS_LAST_SYNC', gsLastSync);
+      gsUpdateStatusWidget();
+      toast(`✅ Exportação concluída: ${exported} abas atualizadas${failed?' · '+failed+' com erro':''}`);
+      admAddLog('Exportou dados','sheets',`Sistema → Google Sheets (${exported} abas)`);
+      if(admTab==='sheets') admRenderContent();
+    } catch(e){
+      toast('Erro na exportação: '+e.message,'err');
+      console.error('[Sheets] Export error',e);
+    }
+    if(btn) btn.disabled=false;
+  });
+}
+
+function gsUpdateStatusWidget(){
+  const el = document.getElementById('gs-status-widget');
+  if(!el) return;
+  const auth = gsIsAuthenticated();
+  const lastSync = gsLastSync ? new Date(gsLastSync).toLocaleString('pt-BR') : null;
+  if(auth){
+    el.innerHTML = `<span style="font-size:10px;color:var(--green)">●</span><span style="font-size:11px;color:var(--text2)">${lastSync?'Sheets: '+lastSync:'Sheets conectado'}</span>`;
+  } else {
+    el.innerHTML = `<button class="btn btn-sm" onclick="goto('admin');admSetTab('sheets')" title="Configurar Google Sheets" style="font-size:11px;gap:4px">🔗 Sheets</button>`;
+  }
+}
+
+function admRenderSheets(el){
+  const cfg = gsLoadConfig();
+  const id = cfg.spreadsheetId || GS_SPREADSHEET_ID;
+  const lastSync = gsLastSync ? new Date(gsLastSync).toLocaleString('pt-BR') : 'Nunca';
+  const auth = gsIsAuthenticated();
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:20px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔗 Status da Conexão</div>
+        <div style="display:flex;flex-direction:column;gap:10px;font-size:12px">
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text2)">Autenticado:</span>
+            <span style="color:${auth?'var(--green)':'var(--red)'};font-weight:600">${auth?'✅ Sim':'❌ Não'}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text2)">Última sincronização:</span>
+            <span style="font-family:var(--mono);font-size:11px">${esc(lastSync)}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text2)">ID da Planilha:</span>
+            <a href="https://docs.google.com/spreadsheets/d/${esc(id)}/edit" target="_blank" style="font-family:var(--mono);font-size:10px;color:var(--blue);text-decoration:none;overflow:hidden;text-overflow:ellipsis;max-width:180px;display:inline-block">${esc(id.slice(0,22))}…</a>
+          </div>
+        </div>
+        <div style="margin-top:14px;display:flex;gap:8px">
+          ${!auth
+            ? `<button class="btn btn-primary" onclick="gsAuth()" style="flex:1">🔐 Autenticar Google</button>`
+            : `<button class="btn" onclick="gsAccessToken=null;gsUpdateStatusWidget();admRenderContent()" style="flex:1">🔓 Desconectar</button>`
+          }
+        </div>
+      </div>
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:20px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚡ Sincronização</div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <button id="gs-btn-import" class="btn btn-primary" onclick="gsSyncFrom()" style="width:100%;justify-content:center">⬇️ Importar do Google Sheets</button>
+          <button id="gs-btn-export" class="btn" onclick="gsSyncTo()" style="width:100%;justify-content:center">⬆️ Exportar para Google Sheets</button>
+          <button class="btn" onclick="gsListSheets()" style="width:100%;justify-content:center">🔍 Listar Abas da Planilha</button>
+          <a href="https://docs.google.com/spreadsheets/d/${esc(id)}/edit" target="_blank" class="btn" style="width:100%;justify-content:center;text-align:center">📊 Abrir Planilha no Google</a>
+        </div>
+      </div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--rl);padding:20px;margin-bottom:16px">
+      <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚙️ Configurações</div>
+      <div class="form-grid">
+        <div class="fg s2">
+          <label class="form-label">ID da Planilha (Spreadsheet ID)</label>
+          <input class="form-input" id="gs-cfg-id" value="${esc(id)}" placeholder="1iEXnpHQ7jKWiEkNYY...">
+        </div>
+        <div class="fg">
+          <label class="form-label">Google OAuth Client ID <span style="color:var(--red)">*</span></label>
+          <input class="form-input" id="gs-cfg-clientid" value="${esc(cfg.clientId||'')}" placeholder="000000.apps.googleusercontent.com">
+        </div>
+        <div class="fg">
+          <label class="form-label">API Key (leitura sem login, opcional)</label>
+          <input class="form-input" id="gs-cfg-apikey" value="${esc(cfg.apiKey||'')}" placeholder="AIzaSy...">
+        </div>
+      </div>
+      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin:16px 0 8px">Nomes das Abas na Planilha</div>
+      <div class="form-grid">
+        ${GS_SHEETS.map(s=>`
+          <div class="fg">
+            <label class="form-label">${esc(s.label)}</label>
+            <input class="form-input" data-gs-sheet="${esc(s.key)}" value="${esc((cfg.sheetNames&&cfg.sheetNames[s.key])||s.defaultSheet)}" placeholder="${esc(s.defaultSheet)}">
+          </div>`).join('')}
+      </div>
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" onclick="gsSaveConfigForm()">💾 Salvar Configurações</button>
+      </div>
+    </div>
+    <div style="background:var(--blue-d);border:1px solid rgba(56,139,253,.25);border-radius:var(--rl);padding:18px">
+      <div style="font-size:13px;font-weight:600;color:var(--blue);margin-bottom:10px">ℹ️ Como configurar a sincronização</div>
+      <ol style="font-size:12px;color:var(--text2);margin:0;padding-left:18px;line-height:1.9">
+        <li>Acesse o <a href="https://console.cloud.google.com" target="_blank" style="color:var(--blue)">Google Cloud Console</a> e crie ou selecione um projeto</li>
+        <li>Ative a <strong style="color:var(--text)">Google Sheets API</strong> em <em>APIs e Serviços</em></li>
+        <li>Em <em>Credenciais</em>, crie um <strong style="color:var(--text)">ID do Cliente OAuth 2.0</strong> do tipo <em>Aplicativo Web</em></li>
+        <li>Adicione a URL desta página em <em>Origens JavaScript Autorizadas</em></li>
+        <li>Cole o <strong style="color:var(--text)">Client ID</strong> no campo acima e clique em <strong>Salvar Configurações</strong></li>
+        <li>Certifique-se que os nomes das abas correspondem às abas da sua planilha (use <em>Listar Abas</em>)</li>
+        <li>Clique em <strong style="color:var(--text)">Autenticar Google</strong> e depois em <strong style="color:var(--text)">Importar</strong> ou <strong style="color:var(--text)">Exportar</strong></li>
+      </ol>
+    </div>`;
+}
+
+function gsSaveConfigForm(){
+  const id = (document.getElementById('gs-cfg-id')?.value||'').trim();
+  const clientId = (document.getElementById('gs-cfg-clientid')?.value||'').trim();
+  const apiKey = (document.getElementById('gs-cfg-apikey')?.value||'').trim();
+  const sheetInputs = document.querySelectorAll('[data-gs-sheet]');
+  const sheetNames = {};
+  sheetInputs.forEach(el=>{sheetNames[el.dataset.gsSheet]=el.value.trim();});
+  gsSaveConfig({spreadsheetId:id||GS_SPREADSHEET_ID, clientId, apiKey, sheetNames});
+  gsTokenClient = null;
+  gsInitTokenClient();
+  toast('✅ Configurações salvas!');
+  admRenderContent();
+}
+
+async function gsListSheets(){
+  const doList = async function(){
+    try{
+      const sheets = await gsGetSheetNames();
+      document.getElementById('modal-title').textContent = 'Abas da Planilha';
+      document.getElementById('modal-body').innerHTML = `
+        <div style="font-size:13px;color:var(--text2);margin-bottom:14px">Abas encontradas na planilha Google Sheets:</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+          ${sheets.map(s=>`<span class="badge bg" style="font-size:12px;padding:4px 10px">${esc(s)}</span>`).join('')}
+        </div>
+        <div style="font-size:12px;color:var(--text3)">Configure os nomes das abas na aba de configurações acima para que correspondam exatamente.</div>`;
+      document.getElementById('modal-foot').innerHTML = `<button class="btn" onclick="closeModal()">Fechar</button>`;
+      document.getElementById('modal').classList.add('open');
+    } catch(e){
+      toast('Erro ao listar abas: '+e.message,'err');
+    }
+  };
+  if(gsIsAuthenticated()){await doList();}
+  else{gsAuth(doList);}
+}
+
 // ── INIT ─────────────────────────────────────────────────────────────────────
 updateBadges();
 buildDashboard();
 updateCurrentUserWidget();
+gsUpdateStatusWidget();
+// Init GIS token client once the library loads
+if(typeof google !== 'undefined' && google.accounts) {
+  gsInitTokenClient();
+} else {
+  window.addEventListener('load', function(){
+    setTimeout(gsInitTokenClient, 500);
+  });
+}
 </script>
 </body>
 </html>
