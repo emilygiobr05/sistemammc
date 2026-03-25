@@ -3290,10 +3290,25 @@ let gsLastSync = localStorage.getItem('GS_LAST_SYNC') || null;
 
 function gsLoadConfig(){try{return JSON.parse(localStorage.getItem('GS_CONFIG')||'{}');}catch(e){return{};}}
 function gsSaveConfig(cfg){localStorage.setItem('GS_CONFIG',JSON.stringify(cfg));}
-function gsIsReady(){return !!(gsLoadConfig().webAppUrl||'').trim();}
+function gsExtractSpreadsheetId(urlOrId){
+  if(!urlOrId) return '';
+  const m = urlOrId.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+  if(m) return m[1];
+  if(/^[a-zA-Z0-9_-]{20,}$/.test(urlOrId.trim())) return urlOrId.trim();
+  return '';
+}
+function gsIsReadOnly(){
+  const cfg = gsLoadConfig();
+  return !!gsExtractSpreadsheetId(cfg.sheetUrl||'') && !(cfg.webAppUrl||'').trim();
+}
+function gsIsReady(){
+  const cfg = gsLoadConfig();
+  return !!(cfg.webAppUrl||'').trim() || !!gsExtractSpreadsheetId(cfg.sheetUrl||'');
+}
 
 // ── Apps Script fetch helpers ─────────────────────────────────────────────────
 async function gasGet(sheet){
+  if(gsIsReadOnly()) return csvGet(sheet);
   const cfg = gsLoadConfig();
   const base = (cfg.webAppUrl||'').trim();
   if(!base) throw new Error('URL do Web App não configurada. Vá em Administração → Google Sheets.');
@@ -3337,6 +3352,43 @@ async function gasListSheets(){
 
 // Legacy aliases used by read-only context (keep gsGetSheetNames working)
 async function gsGetSheetNames(){ return gasListSheets(); }
+
+// ── CSV fetch (read-only mode — public spreadsheet, no Apps Script needed) ────
+function csvParse(text){
+  const rows=[]; let row=[], field='', inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(inQ){
+      if(c==='"'){ if(text[i+1]==='"'){ field+='"'; i++; } else inQ=false; }
+      else field+=c;
+    } else {
+      if(c==='"') inQ=true;
+      else if(c===','){ row.push(field); field=''; }
+      else if(c==='\n'||c==='\r'){
+        row.push(field); field='';
+        if(row.some(v=>v!=='')) rows.push(row);
+        row=[];
+        if(c==='\r'&&text[i+1]==='\n') i++;
+      } else field+=c;
+    }
+  }
+  if(field||row.length){ row.push(field); if(row.some(v=>v!=='')) rows.push(row); }
+  return rows;
+}
+
+async function csvGet(sheetName){
+  const cfg = gsLoadConfig();
+  const id = gsExtractSpreadsheetId(cfg.sheetUrl||'') || cfg.spreadsheetId || GS_SPREADSHEET_ID;
+  if(!id) throw new Error('ID da planilha não encontrado. Verifique o link em Administração → Google Sheets.');
+  const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(`Erro ao buscar "${sheetName}": HTTP ${res.status}. Verifique se a planilha está compartilhada como "qualquer pessoa com o link".`);
+  const text = await res.text();
+  if(!text||text.trim()==='') throw new Error(`Aba "${sheetName}" está vazia ou não foi encontrada.`);
+  if(text.trim().startsWith('<')||text.trim().startsWith('google.visualization'))
+    throw new Error(`Aba "${sheetName}" não encontrada ou a planilha não está pública. Compartilhe como "qualquer pessoa com o link pode ver".`);
+  return {values: csvParse(text)};
+}
 
 function gsObjsToRows(arr, skipCols){
   if(!arr||!arr.length) return [[]];
@@ -3552,7 +3604,7 @@ const GS_SHEETS = [
 ];
 
 async function gsSyncFrom(){
-  if(!gsIsReady()){ toast('Configure a URL do Web App em Administração → Google Sheets.','err'); return; }
+  if(!gsIsReady()){ toast('Configure o Google Sheets em Administração → Google Sheets.','err'); return; }
   const btn=document.getElementById('gs-btn-import');
   if(btn) btn.disabled=true;
   try{
@@ -3594,6 +3646,7 @@ async function gsSyncFrom(){
 }
 
 async function gsSyncTo(){
+  if(gsIsReadOnly()){ toast('⚠️ Modo somente leitura: configure o Web App para exportar para a planilha.','err'); return; }
   if(!gsIsReady()){ toast('Configure a URL do Web App em Administração → Google Sheets.','err'); return; }
   const btn=document.getElementById('gs-btn-export');
   if(btn) btn.disabled=true;
@@ -3638,7 +3691,8 @@ function gsUpdateStatusWidget(){
   const ready = gsIsReady();
   const lastSync = gsLastSync ? new Date(gsLastSync).toLocaleString('pt-BR') : null;
   if(ready){
-    el.innerHTML = `<span style="font-size:10px;color:var(--green)">●</span><span style="font-size:11px;color:var(--text2)">${lastSync?'Sheets: '+lastSync:'Sheets configurado'}</span>`;
+    const mode = gsIsReadOnly() ? '📋 Somente leitura' : '🔄 Bidirecional';
+    el.innerHTML = `<span style="font-size:10px;color:var(--green)">●</span><span style="font-size:11px;color:var(--text2)">${lastSync?'Sheets: '+lastSync:mode}</span>`;
   } else {
     el.innerHTML = `<button class="btn btn-sm" onclick="goto('admin');admSetTab('sheets')" title="Configurar Google Sheets" style="font-size:11px;gap:4px">🔗 Configurar Sheets</button>`;
   }
@@ -3705,14 +3759,18 @@ function jsonOut(obj) {
     .setMimeType(ContentService.MimeType.JSON);
 }`;
 
+  const readOnly = gsIsReadOnly();
+  const modeLabel = !ready ? '❌ Não configurado' : readOnly ? '📋 Somente leitura' : '🔄 Bidirecional';
+  const modeColor = !ready ? 'var(--red)' : 'var(--green)';
+
   el.innerHTML = `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
       <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:20px">
         <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔗 Status</div>
         <div style="display:flex;flex-direction:column;gap:10px;font-size:12px">
           <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text2)">Web App configurado:</span>
-            <span style="color:${ready?'var(--green)':'var(--red)'};font-weight:600">${ready?'✅ Sim':'❌ Não'}</span>
+            <span style="color:var(--text2)">Modo:</span>
+            <span style="color:${modeColor};font-weight:600">${modeLabel}</span>
           </div>
           <div style="display:flex;justify-content:space-between">
             <span style="color:var(--text2)">Sincronização automática:</span>
@@ -3732,32 +3790,50 @@ function jsonOut(obj) {
         <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚡ Sincronização</div>
         <div style="display:flex;flex-direction:column;gap:10px">
           <button id="gs-btn-import" class="btn btn-primary" onclick="gsSyncFrom()" style="width:100%;justify-content:center">⬇️ Importar do Google Sheets</button>
-          <button id="gs-btn-export" class="btn" onclick="gsSyncTo()" style="width:100%;justify-content:center">⬆️ Exportar para Google Sheets</button>
+          <button id="gs-btn-export" class="btn" onclick="gsSyncTo()" style="width:100%;justify-content:center${readOnly?';opacity:.45;cursor:not-allowed':''}" ${readOnly?'title="Modo somente leitura"':''}>⬆️ Exportar para Google Sheets${readOnly?' 🔒':''}</button>
           <button class="btn" onclick="gsListSheets()" style="width:100%;justify-content:center">🔍 Listar Abas da Planilha</button>
           <a href="https://docs.google.com/spreadsheets/d/${esc(id)}/edit" target="_blank" class="btn" style="width:100%;justify-content:center;text-align:center">📊 Abrir Planilha no Google</a>
         </div>
       </div>
     </div>
 
-    <!-- STEP 1: Apps Script code -->
-    <div style="background:var(--bg2);border:1px solid rgba(210,153,34,.4);border-radius:var(--rl);padding:20px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:600;color:var(--amber);margin-bottom:8px">📋 Passo 1 — Cole este código na sua planilha</div>
+    <!-- MODO SIMPLES: só colar o link da planilha -->
+    <div style="background:var(--bg2);border:2px solid ${readOnly?'rgba(34,197,94,.6)':'var(--border)'};border-radius:var(--rl);padding:20px;margin-bottom:16px">
+      <div style="font-size:14px;font-weight:600;color:var(--green);margin-bottom:8px">⚡ Modo Simples — Cole o link da planilha</div>
       <div style="font-size:12px;color:var(--text2);margin-bottom:12px">
-        Na planilha Google Sheets, clique em <strong style="color:var(--text)">Extensões → Apps Script</strong>, apague o conteúdo e cole o código abaixo. Depois clique em 
+        Compartilhe a planilha no Google Sheets como <strong style="color:var(--text)">Qualquer pessoa com o link pode ver</strong> e cole o link abaixo.
+        Importa os dados diretamente, sem precisar do Apps Script.
+        <em style="color:var(--text3)">(Somente leitura — não envia alterações de volta para a planilha)</em>
+      </div>
+      <div class="form-grid">
+        <div class="fg s2">
+          <label class="form-label">Link da Planilha Google Sheets</label>
+          <input class="form-input" id="gs-cfg-sheeturl" value="${esc(cfg.sheetUrl||'')}" placeholder="https://docs.google.com/spreadsheets/d/XXXXXXXXXX/edit">
+        </div>
+      </div>
+      <div style="margin-top:10px;font-size:11px;color:var(--text3)">
+        💡 Depois de colar o link, clique em <strong>💾 Salvar</strong> abaixo e use <strong>⬇️ Importar</strong> para carregar os dados.
+      </div>
+    </div>
+
+    <!-- MODO BIDIRECIONAL: Apps Script Web App -->
+    <div style="background:var(--bg2);border:1px solid rgba(210,153,34,.4);border-radius:var(--rl);padding:20px;margin-bottom:16px">
+      <div style="font-size:14px;font-weight:600;color:var(--amber);margin-bottom:8px">🔧 Modo Bidirecional (opcional) — Permite também exportar alterações para a planilha</div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:12px">
+        Na planilha Google Sheets, clique em <strong style="color:var(--text)">Extensões → Apps Script</strong>, apague o conteúdo e cole o código abaixo. Depois clique em
         <strong style="color:var(--text)">Implantar → Nova implantação → Aplicativo da Web</strong> (Executar como: Eu · Acesso: Qualquer pessoa). Copie a URL gerada.
       </div>
       <div style="position:relative">
-        <textarea readonly onclick="this.select()" style="width:100%;height:220px;font-family:var(--mono);font-size:11px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:12px;color:var(--text);resize:vertical;box-sizing:border-box">${GAS_CODE.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea>
+        <textarea readonly onclick="this.select()" style="width:100%;height:220px;font-family:var(--mono);font-size:11px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:10px;resize:vertical;box-sizing:border-box">${esc(GAS_CODE)}</textarea>
         <button class="btn btn-sm" onclick="navigator.clipboard.writeText(document.querySelector('#adm-content textarea').value);toast('Código copiado!')" style="position:absolute;top:8px;right:8px">📋 Copiar</button>
       </div>
     </div>
 
-    <!-- STEP 2: Paste Web App URL -->
+    <!-- SALVAR CONFIGURAÇÕES -->
     <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--rl);padding:20px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔧 Passo 2 — Cole a URL do Web App</div>
       <div class="form-grid">
         <div class="fg s2">
-          <label class="form-label">URL do Web App <span style="color:var(--red)">*</span></label>
+          <label class="form-label">URL do Web App <span style="color:var(--text3);font-weight:400">(opcional — somente para modo bidirecional)</span></label>
           <input class="form-input" id="gs-cfg-webapp" value="${esc(cfg.webAppUrl||'')}" placeholder="https://script.google.com/macros/s/XXXXXXXXXX/exec">
         </div>
         <div class="fg s2">
@@ -3774,16 +3850,19 @@ function jsonOut(obj) {
 }
 
 function gsSaveConfigForm(){
+  const sheetUrl = (document.getElementById('gs-cfg-sheeturl')?.value||'').trim();
   const webAppUrl = (document.getElementById('gs-cfg-webapp')?.value||'').trim();
   const autoSync = document.getElementById('gs-cfg-autosync')?.checked||false;
   const prev = gsLoadConfig();
-  gsSaveConfig({...prev, spreadsheetId:GS_SPREADSHEET_ID, webAppUrl, autoSync, syncInterval:5});
+  const extractedId = gsExtractSpreadsheetId(sheetUrl) || prev.spreadsheetId || GS_SPREADSHEET_ID;
+  gsSaveConfig({...prev, sheetUrl, spreadsheetId:extractedId, webAppUrl, autoSync, syncInterval:5});
   gsStartAutoSync();
   toast('✅ Configurações salvas!');
   admRenderContent();
 }
 
 async function gsListSheets(){
+  if(gsIsReadOnly()){ toast('Listagem de abas disponível apenas no modo bidirecional (Web App).','err'); return; }
   if(!gsIsReady()){ toast('Configure a URL do Web App primeiro.','err'); return; }
   try{
     const sheets = await gsGetSheetNames();
@@ -3801,7 +3880,7 @@ async function gsListSheets(){
 
 // ── GS: SINGLE-TABLE PUSH (system → Sheets) ──────────────────────────────────
 async function gsSyncTableTo(key){
-  if(!gsIsReady()) return;
+  if(!gsIsReady()||gsIsReadOnly()) return;
   if(key==='politicos'){
     try{ await gsExportPols(); gsLastSync=new Date().toISOString(); localStorage.setItem('GS_LAST_SYNC',gsLastSync); gsUpdateStatusWidget(); }
     catch(e){ console.warn('[Sheets] Auto-push pols:',e.message); toast('⚠️ Sheets: erro ao enviar Políticos','err'); }
@@ -3830,7 +3909,7 @@ async function gsSyncTableTo(key){
 const gsPushTimers = {};
 function gsPushTable(key){
   const cfg = gsLoadConfig();
-  if(!cfg.autoSync||!gsIsReady()) return;
+  if(!cfg.autoSync||!gsIsReady()||gsIsReadOnly()) return;
   if(gsPushTimers[key]) clearTimeout(gsPushTimers[key]);
   gsPushTimers[key] = setTimeout(()=>{ delete gsPushTimers[key]; gsSyncTableTo(key); }, 800);
 }
@@ -3903,7 +3982,7 @@ gsUpdateStatusWidget();
 // Restart auto-sync timer if it was previously enabled and Web App is configured
 (function(){
   const cfg = gsLoadConfig();
-  if(cfg.autoSync && cfg.webAppUrl) gsStartAutoSync();
+  if(cfg.autoSync && (cfg.webAppUrl || gsExtractSpreadsheetId(cfg.sheetUrl||''))) gsStartAutoSync();
 })();
 </script>
 </body>
