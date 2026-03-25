@@ -3716,7 +3716,7 @@ function jsonOut(obj) {
           </div>
           <div style="display:flex;justify-content:space-between">
             <span style="color:var(--text2)">Sincronização automática:</span>
-            <span style="color:${cfg.autoSync?'var(--green)':'var(--text3)'};font-weight:600">${cfg.autoSync?'🔄 Ativa (a cada '+(cfg.syncInterval||5)+'min)':'⏸ Desativada'}</span>
+            <span style="color:${cfg.autoSync?'var(--green)':'var(--text3)'};font-weight:600">${cfg.autoSync?'🔄 Ativa':'⏸ Desativada'}</span>
           </div>
           <div style="display:flex;justify-content:space-between">
             <span style="color:var(--text2)">Última sincronização:</span>
@@ -3754,59 +3754,30 @@ function jsonOut(obj) {
 
     <!-- STEP 2: Paste Web App URL -->
     <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--rl);padding:20px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔧 Passo 2 — Configurações</div>
+      <div style="font-size:14px;font-weight:600;margin-bottom:14px">🔧 Passo 2 — Cole a URL do Web App</div>
       <div class="form-grid">
         <div class="fg s2">
-          <label class="form-label">URL do Web App <span style="color:var(--red)">*</span> <span style="font-size:10px;color:var(--text3)">(cole aqui a URL gerada após implantar o Apps Script)</span></label>
+          <label class="form-label">URL do Web App <span style="color:var(--red)">*</span></label>
           <input class="form-input" id="gs-cfg-webapp" value="${esc(cfg.webAppUrl||'')}" placeholder="https://script.google.com/macros/s/XXXXXXXXXX/exec">
         </div>
-        <div class="fg">
-          <label class="form-label">Token secreto <span style="font-size:10px;color:var(--text3)">(opcional — deve ser igual ao SECRET_TOKEN no código acima)</span></label>
-          <input class="form-input" id="gs-cfg-token" value="${esc(cfg.webAppToken||'')}" placeholder="Deixe em branco se não configurou">
+        <div class="fg s2">
+          <label class="form-label" style="display:flex;align-items:center;gap:10px;cursor:pointer">
+            <input type="checkbox" id="gs-cfg-autosync" ${cfg.autoSync?'checked':''} style="width:16px;height:16px;accent-color:var(--blue)">
+            <span>Sincronização automática <span style="font-size:11px;color:var(--text3)">(edições enviadas automaticamente; planilha verificada a cada 5 min)</span></span>
+          </label>
         </div>
-        <div class="fg">
-          <label class="form-label">Sincronização Automática Bidirecional</label>
-          <div style="display:flex;align-items:center;gap:10px;padding:8px 0">
-            <input type="checkbox" id="gs-cfg-autosync" ${cfg.autoSync?'checked':''} style="width:16px;height:16px;cursor:pointer;accent-color:var(--blue)">
-            <span style="font-size:12px;color:var(--text2)">Ativar<br><span style="font-size:11px;color:var(--text3)">Edições no sistema são enviadas automaticamente. A planilha é verificada no intervalo abaixo.</span></span>
-          </div>
-        </div>
-        <div class="fg">
-          <label class="form-label">Intervalo de verificação da planilha (minutos)</label>
-          <input class="form-input" id="gs-cfg-interval" type="number" min="1" max="60" value="${cfg.syncInterval||5}">
-        </div>
-      </div>
-      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin:16px 0 8px">Nomes das Abas — Dados Gerais</div>
-      <div class="form-grid">
-        ${GS_SHEETS.filter(s=>!s.multiPol).map(s=>`
-          <div class="fg">
-            <label class="form-label">${esc(s.label)} <span style="font-size:10px;color:var(--text3)">(cabeçalho linha ${s.headerRow||1})</span></label>
-            <input class="form-input" data-gs-sheet="${esc(s.key)}" value="${esc((cfg.sheetNames&&cfg.sheetNames[s.key])||s.defaultSheet)}" placeholder="${esc(s.defaultSheet)}">
-          </div>`).join('')}
-      </div>
-      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin:16px 0 8px">Nomes das Abas — Políticos (por tipo)</div>
-      <div class="form-grid">
-        ${Object.entries(GS_POL_CFG).map(([tipo,pcfg])=>`
-          <div class="fg">
-            <label class="form-label">${esc(tipo)} <span style="font-size:10px;color:var(--text3)">(cabeçalho linha ${pcfg.headerRow})</span></label>
-            <input class="form-input" data-gs-pol="${esc(tipo)}" value="${esc((cfg.sheetNames&&cfg.sheetNames['pol_'+tipo])||pcfg.sheet)}" placeholder="${esc(pcfg.sheet)}">
-          </div>`).join('')}
       </div>
       <div style="margin-top:14px">
-        <button class="btn btn-primary" onclick="gsSaveConfigForm()">💾 Salvar Configurações</button>
+        <button class="btn btn-primary" onclick="gsSaveConfigForm()">💾 Salvar</button>
       </div>
     </div>`;
 }
 
 function gsSaveConfigForm(){
   const webAppUrl = (document.getElementById('gs-cfg-webapp')?.value||'').trim();
-  const webAppToken = (document.getElementById('gs-cfg-token')?.value||'').trim();
   const autoSync = document.getElementById('gs-cfg-autosync')?.checked||false;
-  const syncInterval = parseInt(document.getElementById('gs-cfg-interval')?.value||'5')||5;
-  const sheetNames = {};
-  document.querySelectorAll('[data-gs-sheet]').forEach(el=>{sheetNames[el.dataset.gsSheet]=el.value.trim();});
-  document.querySelectorAll('[data-gs-pol]').forEach(el=>{sheetNames['pol_'+el.dataset.gsPol]=el.value.trim();});
-  gsSaveConfig({spreadsheetId:GS_SPREADSHEET_ID, webAppUrl, webAppToken, autoSync, syncInterval, sheetNames});
+  const prev = gsLoadConfig();
+  gsSaveConfig({...prev, spreadsheetId:GS_SPREADSHEET_ID, webAppUrl, autoSync, syncInterval:5});
   gsStartAutoSync();
   toast('✅ Configurações salvas!');
   admRenderContent();
