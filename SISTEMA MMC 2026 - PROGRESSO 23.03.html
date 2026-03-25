@@ -737,7 +737,7 @@ function viewPol(id) {
 function delPol(id) {
   if(!confirm('Excluir este político?')) return;
   const idx = POLS.findIndex(r=>r._id===id);
-  if(idx!==-1){POLS.splice(idx,1); renderPoliticos(); updateBadges(); toast('Excluído.','err');}
+  if(idx!==-1){POLS.splice(idx,1); renderPoliticos(); updateBadges(); toast('Excluído.','err'); gsPushTable('politicos');}
 }
 
 // ── ANIVERSARIANTES ──────────────────────────────────────────────────────────
@@ -932,6 +932,7 @@ function delAniv(id){
   renderAniversariantes();
   updateBadges();
   toast('Excluído.','err');
+  gsPushTable('aniversariantes');
 }
 
 function anivPage(n){const pages=Math.max(1,Math.ceil(filteredAniv().length/ANIV_ST.per));if(n<1||n>pages)return;ANIV_ST.pg=n;renderAniversariantes();}
@@ -951,7 +952,7 @@ function saveRecord() {
       toast('Político criado!');
     }
     closeModal(); renderPoliticos(); updateBadges();
-  } else if(mMode==='aniv') {
+    gsPushTable('politicos');
     const inputs = document.querySelectorAll('#modal-body [data-key]');
     const rec = {};
     inputs.forEach(el=>{
@@ -973,6 +974,7 @@ function saveRecord() {
     }
     anivSave(ANIV);
     closeModal(); renderAniversariantes(); updateBadges(); rebuildDashboard();
+    gsPushTable('aniversariantes');
   } else {
     saveGenericRecord();
   }
@@ -1902,10 +1904,12 @@ function saveGenericRecord(){
   if(mGenRec){Object.assign(DB[mGenPage].find(r=>r._id===mGenRec._id),rec);toast('Atualizado!');}
   else{const nid=Math.max(0,...DB[mGenPage].map(r=>r._id))+1;DB[mGenPage].push({...rec,_id:nid});toast('Criado!');}
   closeModal(); renderTable(mGenPage); updateBadges();
+  gsPushTable(mGenPage);
 }
 function delGeneric(p,id){
   if(!confirm('Excluir?'))return;
   DB[p]=DB[p].filter(r=>r._id!==id); renderTable(p); updateBadges(); toast('Excluído.','err');
+  gsPushTable(p);
 }
 
 // ── PHOTO UPLOAD ─────────────────────────────────────────────────────────────
@@ -3321,6 +3325,7 @@ function gsAuth(callback){
     gsTokenExpiry = Date.now() + (response.expires_in||3600)*1000;
     toast('✅ Autenticado com Google Sheets!');
     gsUpdateStatusWidget();
+    gsStartAutoSync();
     if(callback) callback();
   };
   gsTokenClient.requestAccessToken({prompt:''});
@@ -3412,68 +3417,190 @@ function gsRowsToObjs(rows){
   });
 }
 
+// ── GS: EXACT SHEET STRUCTURE (mapped from the NOVA PLANILHA MASTER spreadsheet) ──
+// Column name in sheet → field name in HTML
+const GS_COL_TO_FIELD = {
+  'NOME COMPLETO':       'NOME',
+  'NOME ELEITORAL':      'NOME_ELEITORAL',
+  'TIPO APOIO':          'NIVEL_APOIO',
+  'COMENTARIO APOIO':    'COMENTARIO',
+  'COMENTÁTIO APOIO':    'COMENTARIO',   // typo in sheet
+  'PROFISSÃO':           'PROFISSAO',
+  'DATA DE NASCIMENTO':  'DATA_NASC',
+  'DATA DE NASCIMEMTO':  'DATA_NASC',    // typo in sheet
+  'DATA_NASCIMENTO':     'DATA_NASC',
+  'REDE SOCIAL':         'REDE_SOCIAL',
+  'CARGO ':              'CARGO',        // trailing space in sheet
+  'TELEFONE ':           'TELEFONE',     // trailing space in sheet
+  'ÁREA SECRETARIA':     'CARGO',
+  'APOIADOR':            'APOIO',
+  'APOIO_MAURICIO':      'APOIO',
+  'NIVEL_APOIO_MAURICIO':'NIVEL_APOIO',
+  'VOTOS':               'Nº VOTOS',
+  'CARGO_ATUAL':         'CARGO',
+  'OBSERVACOES':         'COMENTARIO',
+  'INSTAGRAM':           'REDE_SOCIAL',
+  'FOTO':                '_foto',        // skip on import
+  'ÁREA_TEMÁTICA':       'AREA_TEMATICA',
+};
+
+// Columns to skip entirely on import (non-data, image, or redundant)
+const GS_SKIP_COLS = new Set([
+  '_foto','FOTO','POPULACAO','Nº ELEITORES','PORCENTAGEM DE VOTOS',
+  'VINCULO_DEPUTADA','NIVEL_INFLUENCIA','ULTIMA_ATUALIZACAO',
+  'ATUALIZAÇÃO MAURICIO','ATUALIZAÇÃO MARIANA',
+]);
+
+// Politician type → exact sheet configuration
+// titleRows = how many non-data rows before the header row
+const GS_POL_CFG = {
+  'Prefeito':       { sheet:'PREFEITOS',       headerRow:2 },
+  'Vice-Prefeito':  { sheet:'VICE_PREFEITOS',  headerRow:2 },
+  'Vereador':       { sheet:'VEREADORES',      headerRow:2 },
+  'Dep. Estadual':  { sheet:'DEP_ESTADUAL',    headerRow:2 },
+  'Dep. Federal':   { sheet:'DEP_FEDERAL',     headerRow:2 },
+  'Senador':        { sheet:'SENADORES',       headerRow:4 },
+  'Liderança':      { sheet:'LIDERANÇAS',      headerRow:1 },
+  'Secretário':     { sheet:'SECRETÁRIOS',     headerRow:1 },
+  'Outras Pessoas': { sheet:'OUTRAS PESSOAS ', headerRow:1 },
+};
+
+// Convert sheet rows (header + data) → JS objects, applying column mapping
+function gsRowsToObjsMapped(rows, headerRow){
+  if(!rows||rows.length<headerRow+1) return [];
+  const headers = rows[headerRow-1]; // 0-indexed
+  const dataRows = rows.slice(headerRow);
+  return dataRows
+    .filter(row=>row.some(v=>v!=null&&v!==''))
+    .map(row=>{
+      const obj={};
+      headers.forEach((col,i)=>{
+        if(!col) return;
+        const field = GS_COL_TO_FIELD[col]||col;
+        if(GS_SKIP_COLS.has(col)||GS_SKIP_COLS.has(field)) return;
+        const v = row[i]??'';
+        if(v!==''&&v!=null&&!isNaN(v)&&!isNaN(parseFloat(v))){
+          obj[field] = parseFloat(v)%1===0 ? parseInt(v,10) : parseFloat(v);
+        } else {
+          obj[field] = (v===''||v==null)?null:String(v);
+        }
+      });
+      return obj;
+    });
+}
+
+// Return the configured sheet name for a politician type
+function gsGetPolSheetName(tipo){
+  const cfg = gsLoadConfig();
+  const def = GS_POL_CFG[tipo];
+  return (cfg.sheetNames&&cfg.sheetNames['pol_'+tipo]) || (def&&def.sheet) || tipo;
+}
+
+// Return the configured sheet name for a non-politician table
 function gsGetSheetName(key){
   const cfg = gsLoadConfig();
   const def = GS_SHEETS.find(s=>s.key===key);
   return (cfg.sheetNames&&cfg.sheetNames[key])||(def&&def.defaultSheet)||key;
 }
 
+// ── IMPORT POLITICIANS (all pol sheets → POLS array) ─────────────────────────
+async function gsImportPols(){
+  const photoMap={};
+  POLS.forEach(r=>{if(r._foto&&r.NOME) photoMap[r.NOME]=r._foto;});
+  const allObjs=[];
+  for(const [tipo,cfg] of Object.entries(GS_POL_CFG)){
+    const shName = gsGetPolSheetName(tipo);
+    try{
+      const data = await gsFetchRange(`${shName}!A:Z`);
+      if(!data.values||data.values.length<=cfg.headerRow) {
+        console.warn(`[Sheets] Pol "${shName}": sem dados`); continue;
+      }
+      const objs = gsRowsToObjsMapped(data.values, cfg.headerRow);
+      objs.forEach(o=>{ o.TIPO=tipo; });
+      allObjs.push(...objs);
+      console.log(`[Sheets] ⬇ "${shName}" (${tipo}): ${objs.length} registros`);
+    } catch(e){
+      console.warn(`[Sheets] Pol import "${shName}": ${e.message}`);
+    }
+  }
+  POLS.length=0;
+  allObjs.forEach((r,i)=>POLS.push({_id:i,_origem:'sheets',_foto:photoMap[r.NOME]||null,...r}));
+  window.POLS_DATA=POLS;
+  return allObjs.length;
+}
+
+// ── EXPORT POLITICIANS (POLS array → each pol sheet, preserving title rows) ──
+async function gsExportPols(){
+  let exported=0;
+  for(const [tipo,polCfg] of Object.entries(GS_POL_CFG)){
+    const arr = POLS.filter(r=>r.TIPO===tipo);
+    const shName = gsGetPolSheetName(tipo);
+    try{
+      // Fetch existing header to preserve exact column names and title rows
+      const meta = await gsFetchRange(`${shName}!A1:Z${polCfg.headerRow}`);
+      const titleRows = (meta.values||[]).slice(0, polCfg.headerRow-1);
+      const headerRow = (meta.values||[])[polCfg.headerRow-1]||[];
+      const headers = headerRow.filter(Boolean);
+      if(!headers.length) { console.warn(`[Sheets] Pol export "${shName}": sem cabeçalho`); continue; }
+
+      // Build data rows using original sheet column names
+      const skip = new Set(['FOTO','_foto','POPULACAO','Nº ELEITORES','PORCENTAGEM DE VOTOS']);
+      const useCols = headers.filter(h=>!skip.has(h));
+      const dataRows = arr.map(r=>useCols.map(col=>{
+        const field = GS_COL_TO_FIELD[col]||col;
+        const v = r[field]??r[col]??'';
+        return (v===null||v===undefined)?'':String(v);
+      }));
+
+      // Write: clear data area, then write data rows
+      const dataStart = polCfg.headerRow+1;
+      await gsClearRange(`${shName}!A${dataStart}:Z9999`);
+      if(dataRows.length){
+        await gsWriteRange(`${shName}!A${dataStart}`, dataRows);
+      }
+      exported++;
+      console.log(`[Sheets] ⬆ "${shName}" (${tipo}): ${dataRows.length} registros`);
+    } catch(e){
+      console.warn(`[Sheets] Pol export "${shName}": ${e.message}`);
+    }
+  }
+  return exported;
+}
+
+// ── DATA TABLE MAPPING (non-politician sheets) ────────────────────────────────
 const GS_SHEETS = [
   {
-    label:'Políticos', key:'politicos', defaultSheet:'politicos',
-    getter:()=>POLS, skipCols:['_foto'],
-    setter(objs){
-      const photoMap={};
-      POLS.forEach(r=>{if(r._foto&&r.NOME) photoMap[r.NOME]=r._foto;});
-      POLS.length=0;
-      objs.forEach((r,i)=>POLS.push({_id:i,_origem:'sheets',_foto:photoMap[r.NOME]||null,...r}));
-      window.POLS_DATA=POLS;
-    }
+    // Politicians are split across multiple dedicated sheets
+    label:'Políticos', key:'politicos', defaultSheet:'(múltiplas abas)',
+    multiPol: true,
+    getter:()=>POLS,
+    setter:null, // handled by gsImportPols / gsExportPols
   },
   {
-    label:'Emendas', key:'emendas', defaultSheet:'emendas',
+    label:'Emendas', key:'emendas', defaultSheet:'EMENDAS', headerRow:1,
     getter:()=>DB.emendas,
-    setter(objs){
-      DB.emendas.length=0;
-      objs.forEach((r,i)=>DB.emendas.push({_id:i,...r}));
-      if(window.RAW_DATA) window.RAW_DATA.emendas=DB.emendas;
-    }
+    setter(objs){ DB.emendas.length=0; objs.forEach((r,i)=>DB.emendas.push({_id:i,...r})); if(window.RAW_DATA) window.RAW_DATA.emendas=DB.emendas; }
   },
   {
-    label:'Solicitações', key:'solicitacoes', defaultSheet:'solicitacoes',
+    label:'Solicitações', key:'solicitacoes', defaultSheet:'SOLICITACOES', headerRow:1,
     getter:()=>DB.solicitacoes,
-    setter(objs){
-      DB.solicitacoes.length=0;
-      objs.forEach((r,i)=>DB.solicitacoes.push({_id:i,...r}));
-      if(window.RAW_DATA) window.RAW_DATA.solicitacoes=DB.solicitacoes;
-    }
+    setter(objs){ DB.solicitacoes.length=0; objs.forEach((r,i)=>DB.solicitacoes.push({_id:i,...r})); if(window.RAW_DATA) window.RAW_DATA.solicitacoes=DB.solicitacoes; }
   },
   {
-    label:'Municípios', key:'municipios', defaultSheet:'municipios',
+    label:'Municípios', key:'municipios', defaultSheet:'MUNICIPIOS', headerRow:1,
     getter:()=>DB.municipios,
-    setter(objs){
-      DB.municipios.length=0;
-      objs.forEach((r,i)=>DB.municipios.push({_id:i,...r}));
-      if(window.RAW_DATA) window.RAW_DATA.municipios=DB.municipios;
-    }
+    setter(objs){ DB.municipios.length=0; objs.forEach((r,i)=>DB.municipios.push({_id:i,...r})); if(window.RAW_DATA) window.RAW_DATA.municipios=DB.municipios; }
   },
   {
-    label:'Resumo', key:'resumo', defaultSheet:'resumo',
+    // "RESUMO POR MUNICIPIO" has a title in row 1, headers in row 2, data from row 3
+    label:'Resumo', key:'resumo', defaultSheet:'RESUMO POR MUNICIPIO', headerRow:2,
     getter:()=>DB.resumo,
-    setter(objs){
-      DB.resumo.length=0;
-      objs.forEach((r,i)=>DB.resumo.push({_id:i,...r}));
-      if(window.RAW_DATA) window.RAW_DATA.resumo=DB.resumo;
-    }
+    setter(objs){ DB.resumo.length=0; objs.forEach((r,i)=>DB.resumo.push({_id:i,...r})); if(window.RAW_DATA) window.RAW_DATA.resumo=DB.resumo; }
   },
   {
-    label:'Aniversariantes', key:'aniversariantes', defaultSheet:'aniversariantes',
+    label:'Aniversariantes', key:'aniversariantes', defaultSheet:'aniversariantes', headerRow:1,
     getter:()=>ANIV,
-    setter(objs){
-      ANIV.length=0;
-      objs.forEach((r,i)=>ANIV.push({_id:i,...r}));
-      anivSave(ANIV);
-    }
+    setter(objs){ ANIV.length=0; objs.forEach((r,i)=>ANIV.push({_id:i,...r})); anivSave(ANIV); }
   },
 ];
 
@@ -3486,37 +3613,36 @@ async function gsSyncFrom(){
       const cfg = gsLoadConfig();
       const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
       let imported=0, skipped=0;
+
       for(const sheet of GS_SHEETS){
         if(!selectedKeys.includes(sheet.key)) continue;
+        if(sheet.multiPol){
+          try{
+            const n = await gsImportPols();
+            if(n>0) imported++;
+            else skipped++;
+          } catch(e){ skipped++; console.warn('[Sheets] Pol import error:',e.message); }
+          continue;
+        }
         const sheetName = gsGetSheetName(sheet.key);
+        const hr = sheet.headerRow||1;
         try{
           const data = await gsFetchRange(`${sheetName}!A:ZZ`);
-          if(data.values&&data.values.length>1){
-            const objs = gsRowsToObjs(data.values);
-            sheet.setter(objs);
-            imported++;
-            console.log(`[Sheets] Importado "${sheetName}": ${objs.length} registros`);
-          } else {
-            skipped++;
-            console.warn(`[Sheets] Aba "${sheetName}" vazia ou não encontrada`);
-          }
-        } catch(e){
-          skipped++;
-          console.warn(`[Sheets] Falha "${sheetName}": ${e.message}`);
-        }
+          if(data.values&&data.values.length>hr){
+            const objs = gsRowsToObjsMapped(data.values, hr);
+            if(objs.length){ sheet.setter(objs); imported++; console.log(`[Sheets] ⬇ "${sheetName}": ${objs.length} registros`); }
+            else { skipped++; console.warn(`[Sheets] "${sheetName}": sem dados válidos`); }
+          } else { skipped++; console.warn(`[Sheets] "${sheetName}": vazia ou não encontrada`); }
+        } catch(e){ skipped++; console.warn(`[Sheets] "${sheetName}": ${e.message}`); }
       }
+
       gsLastSync = new Date().toISOString();
       localStorage.setItem('GS_LAST_SYNC', gsLastSync);
-      rebuildDashboard();
-      updateBadges();
-      gsUpdateStatusWidget();
-      toast(`✅ Importação concluída: ${imported} abas importadas${skipped?' · '+skipped+' ignoradas':''}`);
-      admAddLog('Importou dados','sheets',`Google Sheets → Sistema (${imported} abas)`);
+      rebuildDashboard(); updateBadges(); gsUpdateStatusWidget();
+      toast(`✅ Importação: ${imported} tabelas importadas${skipped?' · '+skipped+' ignoradas':''}`);
+      admAddLog('Importou dados','sheets',`Sheets → Sistema (${imported} tabelas)`);
       if(admTab==='sheets') admRenderContent();
-    } catch(e){
-      toast('Erro na importação: '+e.message,'err');
-      console.error('[Sheets] Import error',e);
-    }
+    } catch(e){ toast('Erro na importação: '+e.message,'err'); console.error('[Sheets] Import error',e); }
     if(btn) btn.disabled=false;
   });
 }
@@ -3530,29 +3656,44 @@ async function gsSyncTo(){
       const cfg = gsLoadConfig();
       const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
       let exported=0, failed=0;
+
       for(const sheet of GS_SHEETS){
         if(!selectedKeys.includes(sheet.key)) continue;
+        if(sheet.multiPol){
+          try{ exported += await gsExportPols(); }
+          catch(e){ failed++; console.warn('[Sheets] Pol export error:',e.message); }
+          continue;
+        }
         const sheetName = gsGetSheetName(sheet.key);
+        const hr = sheet.headerRow||1;
         try{
           const arr = sheet.getter();
-          if(!arr||!arr.length){console.warn(`[Sheets] "${sheetName}" vazio, pulando`);continue;}
-          const rows = gsObjsToRows(arr, sheet.skipCols||[]);
-          await gsClearRange(`${sheetName}!A:ZZ`);
-          await gsWriteRange(`${sheetName}!A1`, rows);
-          exported++;
-          console.log(`[Sheets] Exportado "${sheetName}": ${rows.length-1} registros`);
-        } catch(e){
-          failed++;
-          console.warn(`[Sheets] Falha ao exportar "${sheetName}": ${e.message}`);
-        }
+          if(!arr||!arr.length){ console.warn(`[Sheets] "${sheetName}": vazio, pulando`); continue; }
+          // Preserve title rows (rows above header)
+          if(hr>1){
+            await gsClearRange(`${sheetName}!A${hr+1}:ZZ`);
+            const rows = gsObjsToRows(arr, []);
+            // rows[0] = headers, rows[1..n] = data — write header to row hr, data below
+            await gsWriteRange(`${sheetName}!A${hr}`, rows);
+          } else {
+            const rows = gsObjsToRows(arr, []);
+            await gsClearRange(`${sheetName}!A:ZZ`);
+            await gsWriteRange(`${sheetName}!A1`, rows);
+          }
+          exported++; console.log(`[Sheets] ⬆ "${sheetName}": ${arr.length} registros`);
+        } catch(e){ failed++; console.warn(`[Sheets] "${sheetName}": ${e.message}`); }
       }
+
       gsLastSync = new Date().toISOString();
       localStorage.setItem('GS_LAST_SYNC', gsLastSync);
       gsUpdateStatusWidget();
-      toast(`✅ Exportação concluída: ${exported} abas atualizadas${failed?' · '+failed+' com erro':''}`);
-      admAddLog('Exportou dados','sheets',`Sistema → Google Sheets (${exported} abas)`);
+      toast(`✅ Exportação: ${exported} tabelas atualizadas${failed?' · '+failed+' com erro':''}`);
+      admAddLog('Exportou dados','sheets',`Sistema → Sheets (${exported} tabelas)`);
       if(admTab==='sheets') admRenderContent();
-    } catch(e){
+    } catch(e){ toast('Erro na exportação: '+e.message,'err'); console.error('[Sheets] Export error',e); }
+    if(btn) btn.disabled=false;
+  });
+}
       toast('Erro na exportação: '+e.message,'err');
       console.error('[Sheets] Export error',e);
     }
@@ -3587,6 +3728,10 @@ function admRenderSheets(el){
             <span style="color:${auth?'var(--green)':'var(--red)'};font-weight:600">${auth?'✅ Sim':'❌ Não'}</span>
           </div>
           <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text2)">Sincronização automática:</span>
+            <span style="color:${cfg.autoSync?'var(--green)':'var(--text3)'};font-weight:600">${cfg.autoSync?'🔄 Ativa (a cada '+(cfg.syncInterval||5)+'min)':'⏸ Desativada'}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between">
             <span style="color:var(--text2)">Última sincronização:</span>
             <span style="font-family:var(--mono);font-size:11px">${esc(lastSync)}</span>
           </div>
@@ -3598,12 +3743,12 @@ function admRenderSheets(el){
         <div style="margin-top:14px;display:flex;gap:8px">
           ${!auth
             ? `<button class="btn btn-primary" onclick="gsAuth()" style="flex:1">🔐 Autenticar Google</button>`
-            : `<button class="btn" onclick="gsAccessToken=null;gsUpdateStatusWidget();admRenderContent()" style="flex:1">🔓 Desconectar</button>`
+            : `<button class="btn" onclick="gsAccessToken=null;if(gsAutoSyncTimer){clearInterval(gsAutoSyncTimer);gsAutoSyncTimer=null;}gsUpdateStatusWidget();admRenderContent()" style="flex:1">🔓 Desconectar</button>`
           }
         </div>
       </div>
       <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:20px">
-        <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚡ Sincronização</div>
+        <div style="font-size:14px;font-weight:600;margin-bottom:14px">⚡ Sincronização Manual</div>
         <div style="display:flex;flex-direction:column;gap:10px">
           <button id="gs-btn-import" class="btn btn-primary" onclick="gsSyncFrom()" style="width:100%;justify-content:center">⬇️ Importar do Google Sheets</button>
           <button id="gs-btn-export" class="btn" onclick="gsSyncTo()" style="width:100%;justify-content:center">⬆️ Exportar para Google Sheets</button>
@@ -3627,13 +3772,32 @@ function admRenderSheets(el){
           <label class="form-label">API Key (leitura sem login, opcional)</label>
           <input class="form-input" id="gs-cfg-apikey" value="${esc(cfg.apiKey||'')}" placeholder="AIzaSy...">
         </div>
+        <div class="fg">
+          <label class="form-label">Sincronização Automática Bidirecional</label>
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 0">
+            <input type="checkbox" id="gs-cfg-autosync" ${cfg.autoSync?'checked':''} style="width:16px;height:16px;cursor:pointer;accent-color:var(--blue)">
+            <span style="font-size:12px;color:var(--text2)">Ativar sincronização automática<br><span style="font-size:11px;color:var(--text3)">Mudanças no sistema são enviadas para Sheets automaticamente. Sheets é verificado periodicamente.</span></span>
+          </div>
+        </div>
+        <div class="fg">
+          <label class="form-label">Intervalo de verificação de Sheets (minutos)</label>
+          <input class="form-input" id="gs-cfg-interval" type="number" min="1" max="60" value="${cfg.syncInterval||5}" placeholder="5">
+        </div>
       </div>
-      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin:16px 0 8px">Nomes das Abas na Planilha</div>
+      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin:16px 0 8px">Nomes das Abas — Dados Gerais</div>
       <div class="form-grid">
-        ${GS_SHEETS.map(s=>`
+        ${GS_SHEETS.filter(s=>!s.multiPol).map(s=>`
           <div class="fg">
-            <label class="form-label">${esc(s.label)}</label>
+            <label class="form-label">${esc(s.label)} <span style="font-size:10px;color:var(--text3)">(cabeçalho linha ${s.headerRow||1})</span></label>
             <input class="form-input" data-gs-sheet="${esc(s.key)}" value="${esc((cfg.sheetNames&&cfg.sheetNames[s.key])||s.defaultSheet)}" placeholder="${esc(s.defaultSheet)}">
+          </div>`).join('')}
+      </div>
+      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin:16px 0 8px">Nomes das Abas — Políticos (por tipo)</div>
+      <div class="form-grid">
+        ${Object.entries(GS_POL_CFG).map(([tipo,pcfg])=>`
+          <div class="fg">
+            <label class="form-label">${esc(tipo)} <span style="font-size:10px;color:var(--text3)">(cabeçalho linha ${pcfg.headerRow})</span></label>
+            <input class="form-input" data-gs-pol="${esc(tipo)}" value="${esc((cfg.sheetNames&&cfg.sheetNames['pol_'+tipo])||pcfg.sheet)}" placeholder="${esc(pcfg.sheet)}">
           </div>`).join('')}
       </div>
       <div style="margin-top:14px">
@@ -3641,16 +3805,19 @@ function admRenderSheets(el){
       </div>
     </div>
     <div style="background:var(--blue-d);border:1px solid rgba(56,139,253,.25);border-radius:var(--rl);padding:18px">
-      <div style="font-size:13px;font-weight:600;color:var(--blue);margin-bottom:10px">ℹ️ Como configurar a sincronização</div>
+      <div style="font-size:13px;font-weight:600;color:var(--blue);margin-bottom:10px">ℹ️ Como configurar a sincronização bidirecional</div>
       <ol style="font-size:12px;color:var(--text2);margin:0;padding-left:18px;line-height:1.9">
         <li>Acesse o <a href="https://console.cloud.google.com" target="_blank" style="color:var(--blue)">Google Cloud Console</a> e crie ou selecione um projeto</li>
         <li>Ative a <strong style="color:var(--text)">Google Sheets API</strong> em <em>APIs e Serviços</em></li>
         <li>Em <em>Credenciais</em>, crie um <strong style="color:var(--text)">ID do Cliente OAuth 2.0</strong> do tipo <em>Aplicativo Web</em></li>
         <li>Adicione a URL desta página em <em>Origens JavaScript Autorizadas</em></li>
-        <li>Cole o <strong style="color:var(--text)">Client ID</strong> no campo acima e clique em <strong>Salvar Configurações</strong></li>
-        <li>Certifique-se que os nomes das abas correspondem às abas da sua planilha (use <em>Listar Abas</em>)</li>
-        <li>Clique em <strong style="color:var(--text)">Autenticar Google</strong> e depois em <strong style="color:var(--text)">Importar</strong> ou <strong style="color:var(--text)">Exportar</strong></li>
+        <li>Cole o <strong style="color:var(--text)">Client ID</strong> acima, ative <strong style="color:var(--text)">Sincronização Automática</strong> e clique em <strong>Salvar Configurações</strong></li>
+        <li>Verifique os nomes das abas (use <em>Listar Abas</em>) e ajuste se necessário</li>
+        <li>Clique em <strong style="color:var(--text)">Autenticar Google</strong> — a sincronização bidirecional começará automaticamente</li>
       </ol>
+      <div style="margin-top:10px;padding:10px 12px;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.25);border-radius:var(--r);font-size:12px;color:var(--green)">
+        ✅ <strong>Sincronização bidirecional ativa:</strong> Qualquer edição feita no sistema é enviada automaticamente para a planilha Google Sheets. Alterações feitas diretamente na planilha são detectadas a cada intervalo configurado e aplicadas ao sistema.
+      </div>
     </div>`;
 }
 
@@ -3658,12 +3825,17 @@ function gsSaveConfigForm(){
   const id = (document.getElementById('gs-cfg-id')?.value||'').trim();
   const clientId = (document.getElementById('gs-cfg-clientid')?.value||'').trim();
   const apiKey = (document.getElementById('gs-cfg-apikey')?.value||'').trim();
-  const sheetInputs = document.querySelectorAll('[data-gs-sheet]');
+  const autoSync = document.getElementById('gs-cfg-autosync')?.checked||false;
+  const syncInterval = parseInt(document.getElementById('gs-cfg-interval')?.value||'5')||5;
   const sheetNames = {};
-  sheetInputs.forEach(el=>{sheetNames[el.dataset.gsSheet]=el.value.trim();});
-  gsSaveConfig({spreadsheetId:id||GS_SPREADSHEET_ID, clientId, apiKey, sheetNames});
+  // Non-politician sheets
+  document.querySelectorAll('[data-gs-sheet]').forEach(el=>{sheetNames[el.dataset.gsSheet]=el.value.trim();});
+  // Politician sub-sheets
+  document.querySelectorAll('[data-gs-pol]').forEach(el=>{sheetNames['pol_'+el.dataset.gsPol]=el.value.trim();});
+  gsSaveConfig({spreadsheetId:id||GS_SPREADSHEET_ID, clientId, apiKey, autoSync, syncInterval, sheetNames});
   gsTokenClient = null;
   gsInitTokenClient();
+  gsStartAutoSync();
   toast('✅ Configurações salvas!');
   admRenderContent();
 }
@@ -3689,6 +3861,110 @@ async function gsListSheets(){
   else{gsAuth(doList);}
 }
 
+// ── GS: SINGLE-TABLE PUSH (system → Sheets) ──────────────────────────────────
+async function gsSyncTableTo(key){
+  if(!gsIsAuthenticated()) return;
+  if(key==='politicos'){
+    try{ await gsExportPols(); gsLastSync=new Date().toISOString(); localStorage.setItem('GS_LAST_SYNC',gsLastSync); gsUpdateStatusWidget(); }
+    catch(e){ console.warn('[Sheets] Auto-push pols:',e.message); toast('⚠️ Sheets: erro ao enviar Políticos','err'); }
+    return;
+  }
+  const sheet = GS_SHEETS.find(s=>s.key===key);
+  if(!sheet||!sheet.setter) return;
+  const sheetName = gsGetSheetName(key);
+  const hr = sheet.headerRow||1;
+  try{
+    const arr = sheet.getter();
+    if(!arr||!arr.length) return;
+    if(hr>1){
+      await gsClearRange(`${sheetName}!A${hr+1}:ZZ`);
+      const rows = gsObjsToRows(arr,[]);
+      await gsWriteRange(`${sheetName}!A${hr}`, rows);
+    } else {
+      const rows = gsObjsToRows(arr,[]);
+      await gsClearRange(`${sheetName}!A:ZZ`);
+      await gsWriteRange(`${sheetName}!A1`, rows);
+    }
+    gsLastSync = new Date().toISOString();
+    localStorage.setItem('GS_LAST_SYNC', gsLastSync);
+    gsUpdateStatusWidget();
+    console.log(`[Sheets] ⬆ "${sheetName}": ${arr.length} registros`);
+  } catch(e){
+    console.warn(`[Sheets] Push failed "${sheetName}": ${e.message}`);
+    toast('⚠️ Sheets: erro ao enviar '+sheet.label,'err');
+  }
+}
+
+// Debounced push — called after every save/delete
+const gsPushTimers = {};
+function gsPushTable(key){
+  const cfg = gsLoadConfig();
+  if(!cfg.autoSync||!gsIsAuthenticated()) return;
+  if(gsPushTimers[key]) clearTimeout(gsPushTimers[key]);
+  gsPushTimers[key] = setTimeout(()=>{ delete gsPushTimers[key]; gsSyncTableTo(key); }, 800);
+}
+
+// ── GS: PERIODIC PULL (Sheets → system) ──────────────────────────────────────
+const gsLastSheetHash = {};
+async function gsAutoImport(){
+  if(!gsIsAuthenticated()) return;
+  const cfg = gsLoadConfig();
+  if(!cfg.autoSync) return;
+  const selectedKeys = cfg.selectedSheets||GS_SHEETS.map(s=>s.key);
+  let changed = 0;
+
+  for(const sheet of GS_SHEETS){
+    if(!selectedKeys.includes(sheet.key)) continue;
+    if(sheet.multiPol){
+      // For politicians, poll each sub-sheet and check for changes
+      let polChanged = false;
+      for(const [tipo,polCfg] of Object.entries(GS_POL_CFG)){
+        const shName = gsGetPolSheetName(tipo);
+        try{
+          const data = await gsFetchRange(`${shName}!A:Z`);
+          if(!data.values||data.values.length<=polCfg.headerRow) continue;
+          const newHash = data.values.length+'|'+JSON.stringify(data.values.slice(polCfg.headerRow-1,polCfg.headerRow+2));
+          if(gsLastSheetHash['pol_'+tipo]!==newHash){ gsLastSheetHash['pol_'+tipo]=newHash; polChanged=true; }
+        } catch(e){ console.warn(`[Sheets] Poll pol "${shName}": ${e.message}`); }
+      }
+      if(polChanged){ await gsImportPols(); changed++; }
+      continue;
+    }
+    const sheetName = gsGetSheetName(sheet.key);
+    const hr = sheet.headerRow||1;
+    try{
+      const data = await gsFetchRange(`${sheetName}!A:ZZ`);
+      if(!data.values||data.values.length<=hr) continue;
+      const newHash = data.values.length+'|'+JSON.stringify(data.values.slice(hr-1,hr+2));
+      if(gsLastSheetHash[sheet.key]!==newHash){
+        gsLastSheetHash[sheet.key] = newHash;
+        const objs = gsRowsToObjsMapped(data.values, hr);
+        if(objs.length){ sheet.setter(objs); changed++; console.log(`[Sheets] ⬇ "${sheetName}": ${objs.length} registros`); }
+      }
+    } catch(e){ console.warn(`[Sheets] Poll "${sheetName}": ${e.message}`); }
+  }
+
+  gsLastSync = new Date().toISOString();
+  localStorage.setItem('GS_LAST_SYNC', gsLastSync);
+  gsUpdateStatusWidget();
+  if(changed>0){
+    rebuildDashboard(); updateBadges();
+    toast(`🔄 ${changed} tabela(s) atualizadas do Google Sheets`);
+  }
+}
+
+let gsAutoSyncTimer = null;
+function gsStartAutoSync(){
+  if(gsAutoSyncTimer){clearInterval(gsAutoSyncTimer); gsAutoSyncTimer=null;}
+  const cfg = gsLoadConfig();
+  if(!cfg.autoSync) return;
+  const mins = Math.max(1,parseInt(cfg.syncInterval)||5);
+  gsAutoSyncTimer = setInterval(gsAutoImport, mins*60*1000);
+  console.log(`[Sheets] Auto-sync ativo (a cada ${mins} min)`);
+  // First poll after 3 seconds
+  setTimeout(gsAutoImport, 3000);
+}
+
 // ── INIT ─────────────────────────────────────────────────────────────────────
 updateBadges();
 buildDashboard();
@@ -3702,6 +3978,11 @@ if(typeof google !== 'undefined' && google.accounts) {
     setTimeout(gsInitTokenClient, 500);
   });
 }
+// Restart auto-sync timer if it was previously enabled
+(function(){
+  const cfg = gsLoadConfig();
+  if(cfg.autoSync && cfg.clientId) gsStartAutoSync();
+})();
 </script>
 </body>
 </html>
